@@ -2,94 +2,125 @@ import gzip
 import io
 import json
 import re
+import csv
+import sqlite3
 from collections import defaultdict
-
-import numpy as np
-import pandas as pd
 from flask import Flask, render_template, request, jsonify
 
 app = Flask(__name__)
 app.secret_key = "cyber_cell_secret_key_secure"
 
+MEMORY_DB_URI = "file:case_memdb?mode=memory&cache=shared"
+_db_anchor = sqlite3.connect(MEMORY_DB_URI, uri=True)
+
+def get_db():
+    conn = sqlite3.connect(MEMORY_DB_URI, uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db(clear_all=False):
+    with get_db() as conn:
+        cursor = conn.cursor()
+        if clear_all:
+            cursor.execute("DROP TABLE IF EXISTS raw_csv_rows")
+            cursor.execute("DROP TABLE IF EXISTS files_meta")
+            cursor.execute("DROP TABLE IF EXISTS normalized_records")
+            cursor.execute("DROP TABLE IF EXISTS node_tags")
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS raw_csv_rows (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                filename TEXT,
+                row_json TEXT
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS files_meta (
+                filename TEXT PRIMARY KEY,
+                headers_json TEXT,
+                mode TEXT,
+                source_col TEXT,
+                target_col TEXT,
+                dur_col TEXT,
+                type_col TEXT,
+                dt_col TEXT,
+                time_col TEXT,
+                linked_phone TEXT,
+                target_identity TEXT,
+                is_mapped INTEGER DEFAULT 0
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS normalized_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                filename TEXT,
+                mode TEXT,
+                source TEXT,
+                target TEXT,
+                duration REAL,
+                itype TEXT,
+                idate TEXT,
+                itime TEXT
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS node_tags (
+                node_id TEXT PRIMARY KEY,
+                tag TEXT
+            )
+        """)
+
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_raw_file ON raw_csv_rows(filename)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_norm_src ON normalized_records(source)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_norm_tgt ON normalized_records(target)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_norm_file ON normalized_records(filename)")
+        conn.commit()
+
+init_db()
 
 @app.after_request
 def compress_response(response):
-    """Gzip-compress JSON responses. Graph payloads for large multi-file
-    batches are mostly repeated field names/short strings, which gzip
-    shrinks dramatically (often 5-10x) - this is the biggest lever for
-    'file too big to load' symptoms since it cuts network transfer time."""
-    accept_encoding = request.headers.get('Accept-Encoding', '')
-    if 'gzip' not in accept_encoding.lower():
+    try:
+        accept_encoding = request.headers.get('Accept-Encoding', '')
+        if 'gzip' not in accept_encoding.lower():
+            return response
+        if response.direct_passthrough or response.status_code >= 300:
+            return response
+        if len(response.get_data()) < 2048:
+            return response
+
+        compressed = gzip.compress(response.get_data(), compresslevel=6)
+        response.set_data(compressed)
+        response.headers['Content-Encoding'] = 'gzip'
+        response.headers['Content-Length'] = len(compressed)
         return response
-    if response.direct_passthrough or response.status_code >= 300:
-        return response
-    if len(response.get_data()) < 2048:  # not worth compressing tiny responses
+    except Exception:
         return response
 
-    compressed = gzip.compress(response.get_data(), compresslevel=6)
-    response.set_data(compressed)
-    response.headers['Content-Encoding'] = 'gzip'
-    response.headers['Content-Length'] = len(compressed)
-    return response
-
-# Volatile Data-Cache structures, isolated per process-runtime lifecycle
-app.file_configs = {}
-app.global_active_files = []
-app.cleaned_dfs = {}
-
-# Graph-wide "collapse low-activity contacts" setting. Global (not per-file)
-# because node identity spans across files - the same number/account can
-# appear in multiple staged documents.
-app.grouping_config = {'enabled': False, 'metric': 'count', 'threshold': 0}
-
-# Investigator-assigned names/tags for numbers & accounts (e.g. "Suspect A",
-# "Mule Account 3"). Keyed by node id, global across the case.
-app.node_tags = {}
-
-# Friendly per-file labels (e.g. the primary/most-frequent number in that
-# file) computed automatically after mapping, so the sidebar doesn't just
-# show raw uploaded filenames.
-app.file_display_names = {}
-
-# Cap on how many raw records we attach to a single node's detail panel.
-# Keeps the JSON payload (and browser) fast even on very large CDR dumps.
 MAX_LOGS_PER_NODE = 300
-
-# Hard ceiling on rendered elements before we warn the investigator the
-# graph is still too dense (browser physics layout is what actually
-# crashes/freezes on very large graphs, independent of payload size).
-RENDER_WARNING_THRESHOLD = 3000
-
 _NON_DIGIT_RE = re.compile(r'\D')
 
+def clean_phone_str(val):
+    if not val:
+        return None
+    digits = _NON_DIGIT_RE.sub('', str(val))
+    if len(digits) == 12 and digits.startswith('91'):
+        digits = digits[2:]
+    elif len(digits) == 11 and digits.startswith('0'):
+        digits = digits[1:]
+    return digits if len(digits) == 10 else None
 
-def normalize_phone_series(series):
-    """
-    Data-cleaning step: strips everything to digits, removes a leading
-    country code (91) or trunk prefix (0) if present, and keeps only values
-    that resolve to a clean 10-digit mobile number. Anything else becomes
-    NaN so the normal dropna() validity filter removes that row.
-    """
-    digits = series.astype(str).str.replace(_NON_DIGIT_RE, '', regex=True)
-    is_12_with_91 = (digits.str.len() == 12) & digits.str.startswith('91')
-    digits = digits.where(~is_12_with_91, digits.str.slice(2))
-    is_11_with_0 = (digits.str.len() == 11) & digits.str.startswith('0')
-    digits = digits.where(~is_11_with_0, digits.str.slice(1))
-    valid = digits.str.len() == 10
-    return digits.where(valid, np.nan)
+def parse_float(val):
+    if not val:
+        return 0.0
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return 0.0
 
-
-def _valid_phone_frame(df, src_col, tgt_col):
-    """Returns the subset of df with src/tgt normalized to clean 10-digit
-    numbers, with unparsable/invalid-length rows dropped entirely."""
-    sub = df.dropna(subset=[src_col, tgt_col]).copy()
-    sub[src_col] = normalize_phone_series(sub[src_col])
-    sub[tgt_col] = normalize_phone_series(sub[tgt_col])
-    return sub.dropna(subset=[src_col, tgt_col])
-
-
-
-# Standard column alias mapper for automatic matching
 COLUMN_ALIASES = {
     'source_col': ['target /a party number', 'a party number', 'a_party', 'source_acc', 'from_account', 'source', 'calling_number'],
     'target_col': ['b party number', 'b_party', 'target_acc', 'to_account', 'destination', 'called_number', 'target'],
@@ -99,10 +130,8 @@ COLUMN_ALIASES = {
     'time_col': ['call initiation time', 'call time', 'time', 'txn_time', 'time of call']
 }
 
-
-def auto_detect_columns(df_columns):
-    """Automatically maps raw CSV column headers to internal standard keys."""
-    cols_lower = {col.strip().lower(): col.strip() for col in df_columns}
+def auto_detect_columns(headers):
+    cols_lower = {str(col).strip().lower(): str(col).strip() for col in headers if col}
     mapping = {}
     for standard_key, aliases in COLUMN_ALIASES.items():
         mapping[standard_key] = None
@@ -112,476 +141,319 @@ def auto_detect_columns(df_columns):
                 break
     return mapping
 
+def _compute_graph_and_analysis():
+    conn = get_db()
+    cursor = conn.cursor()
 
-def clean_dataframe(df):
-    """Initial Data Cleaning: strips strings, removes NaN/Null equivalents, normalizes identifiers."""
-    df.columns = df.columns.str.strip()
+    cursor.execute("SELECT * FROM files_meta WHERE is_mapped = 1")
+    mapped_files = cursor.fetchall()
+    if not mapped_files:
+        conn.close()
+        return {
+            'elements': [],
+            'files': [],
+            'meta': {'rendered_elements': 0, 'file_labels': {}},
+            'analysis': {'targets': [], 'bridges': [], 'top_calls': [], 'top_durations': [], 'linked_assets': []}
+        }
 
-    # Strip whitespace & normalize NaN variations across all text columns (vectorized, no per-row apply)
-    for col in df.columns:
-        s = df[col].astype(str).str.strip()
-        df[col] = s.replace(['nan', 'NaN', 'NAN', 'None', 'null', 'NULL', 'N/A', '-'], np.nan)
+    file_labels = {f['filename']: (f['target_identity'] or f['filename']) for f in mapped_files}
+    primary_targets = {f['target_identity'] for f in mapped_files if f['target_identity']}
 
-    return df
-
-
-def _safe_col(df, col_name, fallback=''):
-    """Returns a Series for col_name if it exists & is usable, else a constant fallback Series."""
-    if col_name and col_name in df.columns:
-        return df[col_name].fillna('')
-    return pd.Series([fallback] * len(df), index=df.index)
-
-
-def _aggregate_pairs(valid_df, src_col, tgt_col, label_col, edge_type, raw_edges):
-    """
-    Vectorized replacement for the old per-row `iterrows()` edge builder.
-    Computes, for every unique unordered (node_a, node_b) pair:
-      - total interaction weight
-      - whether a->b and/or b->a directions occurred
-      - a representative label (first non-null amount/duration seen)
-    then merges the (small) per-pair result into the shared raw_edges dict.
-    """
-    if valid_df.empty:
-        return
-
-    s = valid_df[src_col].to_numpy()
-    t = valid_df[tgt_col].to_numpy()
-
-    pmin = np.where(s <= t, s, t)
-    pmax = np.where(s <= t, t, s)
-    is_forward = (s == pmin)
-
-    pair_df = pd.DataFrame({'pmin': pmin, 'pmax': pmax, 'is_forward': is_forward})
-    if label_col and label_col in valid_df.columns:
-        pair_df['label'] = valid_df[label_col].to_numpy()
-        pair_df['numeric_val'] = pd.to_numeric(valid_df[label_col], errors='coerce').fillna(0).to_numpy()
-    else:
-        pair_df['label'] = None
-        pair_df['numeric_val'] = 0.0
-
-    grouped = pair_df.groupby(['pmin', 'pmax'], sort=False)
-    agg = grouped.agg(
-        weight=('is_forward', 'size'),
-        has_fwd=('is_forward', 'any'),
-        has_bwd=('is_forward', lambda x: bool((~x).any())),
-        label=('label', lambda x: next((v for v in x if pd.notna(v)), None)),
-        value_sum=('numeric_val', 'sum'),
-    ).reset_index()
-
-    # itertuples (no per-row Series construction) is far faster than iterrows()
-    # or a separate groupby().apply() pass when there are many distinct pairs.
-    for a, b, weight, has_fwd, has_bwd, label, value_sum in agg.itertuples(index=False, name=None):
-        key = (a, b)
-        entry = raw_edges.get(key)
-        if entry is None:
-            entry = {'total_weight': 0, 'has_fwd': False, 'has_bwd': False, 'type': edge_type, 'label': None, 'value_sum': 0.0}
-            raw_edges[key] = entry
-        entry['total_weight'] += int(weight)
-        entry['has_fwd'] = entry['has_fwd'] or bool(has_fwd)
-        entry['has_bwd'] = entry['has_bwd'] or bool(has_bwd)
-        entry['value_sum'] += float(value_sum)
-        if entry['label'] is None and pd.notna(label):
-            entry['label'] = label
-
-
-def _lookup_node_records(node_id, node_type, cap):
-    """
-    On-demand version of the old bulk node-record builder: computes the
-    interaction records for exactly ONE node, only when its detail panel is
-    opened. This is what keeps the main graph payload small - we no longer
-    pre-build and ship logs/txns for every node whether or not it gets
-    clicked.
-    """
-    records = []
-    total = 0
-    target_mode = 'phone' if node_type == 'phone' else 'bank'
-
-    for filename in app.global_active_files:
-        config = app.file_configs.get(filename)
-        df = app.cleaned_dfs.get(filename)
-        if df is None or not config or config.get('mode') != target_mode:
-            continue
-
-        src_col = config.get('source_col')
-        tgt_col = config.get('target_col')
-        if not src_col or not tgt_col or src_col not in df.columns or tgt_col not in df.columns:
-            continue
-
-        if target_mode == 'phone':
-            working = _valid_phone_frame(df, src_col, tgt_col)
-        else:
-            working = df.dropna(subset=[src_col, tgt_col])
-
-        mask = (working[src_col] == node_id) | (working[tgt_col] == node_id)
-        matched = working[mask]
-        if matched.empty:
-            continue
-        total += len(matched)
-
-        if len(records) >= cap:
-            continue  # still need to count `total` across remaining files
-
-        remaining = cap - len(records)
-        sub = matched.head(remaining)
-
-        if target_mode == 'phone':
-            extra_cols = {'date': config.get('dt_col'), 'time': config.get('time_col'), 'type': config.get('type_col'), 'duration': config.get('dur_col')}
-        else:
-            extra_cols = {'date': config.get('dt_col'), 'time': config.get('time_col'), 'amount': config.get('dur_col')}
-
-        rec_df = pd.DataFrame({
-            'from': sub[src_col].to_numpy(),
-            'to': sub[tgt_col].to_numpy(),
-        })
-        for out_key, col in extra_cols.items():
-            rec_df[out_key] = _safe_col(sub, col).to_numpy()
-
-        records.extend(rec_df.to_dict('records'))
-
-    return records, total
-
-
-def _compute_graph_data():
-    """Runs the vectorized aggregation passes over every active file and
-    returns the raw graph data (node counts, edges, adjacency) with no
-    presentation logic. Shared by the main graph builder and by on-demand
-    endpoints (expand-member) that need the full, ungrouped picture."""
-    phone_counts = defaultdict(int)
-    bank_counts = defaultdict(int)
-    raw_edges = {}
+    cursor.execute("SELECT filename, linked_phone, target_identity FROM files_meta WHERE mode = 'bank' AND linked_phone != 'none' AND is_mapped = 1")
+    cross_links = cursor.fetchall()
+    cross_edges = {(row['linked_phone'], row['target_identity']) for row in cross_links if row['linked_phone'] and row['target_identity']}
     phone_to_bank_map = defaultdict(set)
-    cross_edges = set()
-    node_files = defaultdict(set)  # node id -> set of filenames it appears in
-    file_display_names = {}  # filename -> friendly label (primary/most-frequent number)
+    for p, b in cross_edges:
+        phone_to_bank_map[p].add(b)
 
-    # --- Pass 1: Financial Layer Processing ---
-    for filename in app.global_active_files:
-        config = app.file_configs.get(filename)
-        df = app.cleaned_dfs.get(filename)
+    cursor.execute("SELECT node_id, tag FROM node_tags")
+    node_tags = {str(row['node_id']): str(row['tag']) for row in cursor.fetchall() if row['node_id']}
 
-        if df is None or not config or config.get('mode') != 'bank':
-            continue
+    cursor.execute("""
+        SELECT entity, SUM(cnt) AS total_count, COUNT(DISTINCT filename) AS file_count
+        FROM (
+            SELECT source AS entity, COUNT(*) AS cnt, filename FROM normalized_records WHERE source IS NOT NULL AND source != '' GROUP BY source, filename
+            UNION ALL
+            SELECT target AS entity, COUNT(*) AS cnt, filename FROM normalized_records WHERE target IS NOT NULL AND target != '' GROUP BY target, filename
+        )
+        GROUP BY entity
+    """)
+    node_stats = {str(row['entity']): {'count': int(row['total_count'] or 0), 'file_count': int(row['file_count'] or 0)} for row in cursor.fetchall() if row['entity']}
 
-        src_col = config.get('source_col')
-        tgt_col = config.get('target_col')
-        amt_col = config.get('dur_col')
-        linked_phone = config.get('linked_phone')
-
-        if not src_col or not tgt_col or src_col not in df.columns or tgt_col not in df.columns:
-            continue
-
-        valid_df = df.dropna(subset=[src_col, tgt_col])
-        if valid_df.empty:
-            continue
-
-        primary_suspect_acc = valid_df.iloc[0][src_col]
-        if linked_phone and linked_phone != "none" and pd.notna(primary_suspect_acc):
-            cross_edges.add((linked_phone, primary_suspect_acc))
-            phone_to_bank_map[linked_phone].add(primary_suspect_acc)
-
-        combined_series = pd.concat([valid_df[src_col], valid_df[tgt_col]])
-        for acc, count in combined_series.value_counts().items():
-            bank_counts[acc] += int(count)
-            node_files[acc].add(filename)
-
-        if pd.notna(primary_suspect_acc):
-            file_display_names[filename] = str(primary_suspect_acc)
-
-        _aggregate_pairs(valid_df, src_col, tgt_col, amt_col, 'financial', raw_edges)
-
-    # --- Pass 2: Telecom CDR Matrix Processing ---
-    for filename in app.global_active_files:
-        config = app.file_configs.get(filename)
-        df = app.cleaned_dfs.get(filename)
-
-        if df is None or not config or config.get('mode') != 'phone':
-            continue
-
-        src_col = config.get('source_col')
-        tgt_col = config.get('target_col')
-        dur_col = config.get('dur_col')
-
-        if not src_col or not tgt_col or src_col not in df.columns or tgt_col not in df.columns:
-            continue
-
-        # Data-cleaning: normalize to clean 10-digit numbers, drop anything
-        # that isn't (garbage entries, short codes, malformed OCR/export junk).
-        valid_df = _valid_phone_frame(df, src_col, tgt_col)
-        if valid_df.empty:
-            continue
-
-        combined_series = pd.concat([valid_df[src_col], valid_df[tgt_col]])
-        value_counts = combined_series.value_counts()
-        for num, count in value_counts.items():
-            phone_counts[num] += int(count)
-            node_files[num].add(filename)
-
-        if not value_counts.empty:
-            # The most-frequent number in a single target's CDR dump is
-            # almost always the target's own number (their outgoing +
-            # incoming legs together outweigh any single contact).
-            file_display_names[filename] = str(value_counts.idxmax())
-
-        _aggregate_pairs(valid_df, src_col, tgt_col, dur_col, 'telecom', raw_edges)
+    cursor.execute("""
+        SELECT 
+            CASE WHEN source <= target THEN source ELSE target END AS pmin,
+            CASE WHEN source <= target THEN target ELSE source END AS pmax,
+            mode,
+            COUNT(*) AS weight,
+            COALESCE(SUM(duration), 0.0) AS dur_sum,
+            MAX(CASE WHEN source <= target THEN 1 ELSE 0 END) AS has_fwd,
+            MAX(CASE WHEN source > target THEN 1 ELSE 0 END) AS has_bwd
+        FROM normalized_records
+        WHERE source IS NOT NULL AND target IS NOT NULL AND source != '' AND target != ''
+        GROUP BY pmin, pmax, mode
+    """)
+    raw_edges = cursor.fetchall()
 
     neighbor_sets = defaultdict(set)
-    for (a, b) in raw_edges.keys():
-        neighbor_sets[a].add(b)
-        neighbor_sets[b].add(a)
+    for row in raw_edges:
+        pmin, pmax = str(row['pmin']), str(row['pmax'])
+        neighbor_sets[pmin].add(pmax)
+        neighbor_sets[pmax].add(pmin)
 
-    return {
-        'phone_counts': phone_counts, 'bank_counts': bank_counts,
-        'raw_edges': raw_edges, 'neighbor_sets': neighbor_sets,
-        'node_files': node_files, 'file_display_names': file_display_names,
-        'phone_to_bank_map': phone_to_bank_map, 'cross_edges': cross_edges,
-    }
+    top_volume_nodes = set()
+    top_duration_nodes = set()
+    node_reasons = defaultdict(list)
+    analysis_top_calls = []
+    analysis_top_durations = []
 
+    for f in mapped_files:
+        fname = f['filename']
+        f_target = str(f['target_identity'] or '')
 
-def _compute_grouping(graph_data, grouping_config):
-    """
-    Decides which low-activity nodes get collapsed into a single summary
-    node attached to their most significant neighbour ("hub"), so a suspect
-    with hundreds of one-off contacts doesn't force the browser to render
-    (and physics-layout) hundreds of individual leaf nodes.
+        cursor.execute("""
+            SELECT entity, SUM(cnt) AS total_calls
+            FROM (
+                SELECT source AS entity, COUNT(*) AS cnt FROM normalized_records WHERE filename = ? AND source != '' GROUP BY source
+                UNION ALL
+                SELECT target AS entity, COUNT(*) AS cnt FROM normalized_records WHERE filename = ? AND target != '' GROUP BY target
+            )
+            WHERE entity != ?
+            GROUP BY entity
+            ORDER BY total_calls DESC
+            LIMIT 3
+        """, (fname, fname, f_target))
+        for row in cursor.fetchall():
+            ent = str(row['entity'])
+            cnt = int(row['total_calls'] or 0)
+            top_volume_nodes.add(ent)
+            node_reasons[ent].append(f"Top 3 Calls in {fname} ({cnt} calls)")
+            analysis_top_calls.append({
+                'file': fname,
+                'target': f_target,
+                'contact': ent,
+                'calls': cnt,
+                'tag': node_tags.get(ent, '')
+            })
 
-    Rules:
-      - Linked/flagged nodes (phone<->bank cross-links) are NEVER grouped -
-        they're investigatively significant regardless of volume.
-      - A node is only grouped if ALL of its edges fall below the threshold.
-        If it has even one edge that clears the bar, it's shown individually
-        with its real connections intact ("has a CDR record worth mapping").
-      - Investigators can also manually pull any specific member out of a
-        group via the group's detail panel (/expand-member).
+        cursor.execute("""
+            SELECT 
+                CASE WHEN source = ? THEN target ELSE source END AS contact,
+                COALESCE(SUM(duration), 0.0) AS total_dur
+            FROM normalized_records
+            WHERE filename = ? AND mode = 'phone' AND (source = ? OR target = ?)
+            GROUP BY contact
+            ORDER BY total_dur DESC
+            LIMIT 5
+        """, (f_target, fname, f_target, f_target))
+        for row in cursor.fetchall():
+            contact = str(row['contact'])
+            dur = float(row['total_dur'] or 0.0)
+            if dur > 0 and contact != f_target:
+                top_duration_nodes.add(contact)
+                node_reasons[contact].append(f"Top 5 Duration in {fname} ({int(dur)}s)")
+                analysis_top_durations.append({
+                    'file': fname,
+                    'target': f_target,
+                    'contact': contact,
+                    'duration_sec': int(dur),
+                    'tag': node_tags.get(contact, '')
+                })
 
-    Returns (groupable_node_ids: set, hub_for_node: dict).
-    """
-    if not grouping_config or not grouping_config.get('enabled'):
-        return set(), {}
+    critical_nodes = set(primary_targets) | set(top_volume_nodes) | set(top_duration_nodes)
 
-    metric = grouping_config.get('metric', 'count')
-    try:
-        threshold = float(grouping_config.get('threshold') or 0)
-    except (TypeError, ValueError):
-        threshold = 0
-    if threshold <= 0:
-        return set(), {}
+    for pt in primary_targets:
+        if pt:
+            node_reasons[pt].append("Target Suspect")
 
-    raw_edges = graph_data['raw_edges']
-    phone_to_bank_map = graph_data['phone_to_bank_map']
-    cross_edges = graph_data['cross_edges']
+    for p, b in cross_edges:
+        critical_nodes.add(p)
+        critical_nodes.add(b)
+        node_reasons[p].append("Linked Bank Asset")
+        node_reasons[b].append("Linked Phone Asset")
 
-    adjacency = defaultdict(list)
-    for key, edata in raw_edges.items():
-        a, b = key
-        adjacency[a].append((b, edata))
-        adjacency[b].append((a, edata))
+    for node in node_tags:
+        critical_nodes.add(node)
+        node_reasons[node].append("Investigator Tagged")
 
-    protected = set(phone_to_bank_map.keys())
-    for members in phone_to_bank_map.values():
-        protected.update(members)
-    for ph, bk in cross_edges:
-        protected.add(ph)
-        protected.add(bk)
-
-    def edge_value(edata):
-        if metric == 'duration' and edata['type'] == 'telecom':
-            return edata.get('value_sum', 0) / 60.0  # assume seconds -> minutes
-        return edata['total_weight']
-
-    groupable = set()
-    hub_for_node = {}
-
-    all_nodes = list(graph_data['phone_counts'].keys()) + list(graph_data['bank_counts'].keys())
-    for node in all_nodes:
-        if node in protected:
-            continue
-        edges = adjacency.get(node)
-        if not edges:
-            continue  # isolated node - nothing to attach a group edge to, leave as-is
-
-        if all(edge_value(edata) < threshold for (_, edata) in edges):
-            best_neighbor, _ = max(edges, key=lambda e: e[1]['total_weight'])
-            groupable.add(node)
-            hub_for_node[node] = best_neighbor
-
-    return groupable, hub_for_node
-
-
-def process_active_files_fast():
-    """Builds the renderable graph: vectorized aggregation (fast even on
-    large multi-file batches) + on-demand phone-number cleaning + optional
-    low-activity node grouping (keeps the browser from choking on graphs
-    with thousands of one-off contacts).
-
-    NOTE: node payloads intentionally do NOT embed full interaction records
-    (logs/txns) - those are fetched on demand via /node-details when a node
-    is clicked, to keep this response small.
-
-    Returns (elements, meta).
-    """
-    graph_data = _compute_graph_data()
-    phone_counts = graph_data['phone_counts']
-    bank_counts = graph_data['bank_counts']
-    raw_edges = graph_data['raw_edges']
-    neighbor_sets = graph_data['neighbor_sets']
-    phone_to_bank_map = graph_data['phone_to_bank_map']
-    cross_edges = graph_data['cross_edges']
-
-    groupable, hub_for_node = _compute_grouping(graph_data, app.grouping_config)
+    analysis_bridges = []
+    for entity, stats in node_stats.items():
+        if stats['file_count'] >= 2:
+            critical_nodes.add(entity)
+            node_reasons[entity].append(f"Common across {stats['file_count']} CDR files")
+            analysis_bridges.append({
+                'entity': entity,
+                'file_count': stats['file_count'],
+                'total_interactions': stats['count'],
+                'tag': node_tags.get(entity, '')
+            })
 
     elements = []
+    routine_buckets = defaultdict(lambda: {'members': [], 'total_interactions': 0})
 
-    node_files = graph_data['node_files']
+    for entity, stats in node_stats.items():
+        is_phone = (len(entity) == 10 and entity.isdigit())
+        node_type = 'phone' if is_phone else 'bank'
+        degree = len(neighbor_sets.get(entity, ()))
 
-    # Format Phone Nodes (skip anything collapsed into a group) - size
-    # reflects number of DISTINCT connections, not raw call volume.
-    for num, total_interactions in phone_counts.items():
-        if num in groupable:
+        if entity in critical_nodes:
+            size = min(22 + (degree * 4), 65) if is_phone else min(22 + (degree * 5), 70)
+            is_linked = entity in phone_to_bank_map
+
+            if entity in primary_targets:
+                role_class = "role_main_target"
+            elif stats['file_count'] >= 2:
+                role_class = "role_bridge_node"
+            elif is_linked:
+                role_class = "phone_orange"
+            elif is_phone:
+                role_class = "phone_standard"
+            else:
+                role_class = "bank_node"
+
+            ring_class = ""
+            is_top_v = entity in top_volume_nodes
+            is_top_d = entity in top_duration_nodes
+            if is_top_v and is_top_d:
+                ring_class = "ring_top_both"
+            elif is_top_v:
+                ring_class = "ring_top_volume"
+            elif is_top_d:
+                ring_class = "ring_top_duration"
+
+            classes = f"{role_class} {ring_class}".strip()
+
+            elements.append({
+                'data': {
+                    'id': entity,
+                    'phone_number' if is_phone else 'account_number': entity,
+                    'total_interactions': stats['count'],
+                    'connections': degree,
+                    'size': size,
+                    'node_type': node_type,
+                    'linked_banks': list(phone_to_bank_map[entity]) if is_linked else [],
+                    'tag': node_tags.get(entity, ''),
+                    'flags': list(set(node_reasons.get(entity, [])))
+                },
+                'classes': classes
+            })
+        else:
+            neighbors = neighbor_sets.get(entity, set())
+            if neighbors:
+                hub = max(neighbors, key=lambda n: node_stats.get(n, {}).get('count', 0))
+                routine_buckets[(hub, node_type)]['members'].append(entity)
+                routine_buckets[(hub, node_type)]['total_interactions'] += stats['count']
+
+    rendered_node_ids = {el['data']['id'] for el in elements}
+
+    for (hub, ntype), bucket in routine_buckets.items():
+        if hub not in rendered_node_ids:
             continue
-        degree = len(neighbor_sets.get(num, ()))
-        calculated_size = min(16 + (degree * 4), 60)
-        is_linked = num in phone_to_bank_map
+        gid = f"group_{hub}_{ntype}"
+        count = len(bucket['members'])
         elements.append({
             'data': {
-                'id': num, 'phone_number': num, 'total_interactions': total_interactions,
-                'connections': degree, 'size': calculated_size, 'node_type': 'phone',
-                'linked_banks': list(phone_to_bank_map[num]) if is_linked else [],
-                'source_files': list(node_files.get(num, [])),
-                'tag': app.node_tags.get(num, '')
-            },
-            'classes': "phone_orange" if is_linked else "phone_standard"
-        })
-
-    # Format Bank Nodes
-    for acc, total_transactions in bank_counts.items():
-        if acc in groupable:
-            continue
-        degree = len(neighbor_sets.get(acc, ()))
-        calculated_size = min(18 + (degree * 5), 65)
-        elements.append({
-            'data': {
-                'id': acc, 'account_number': acc, 'total_transactions': total_transactions,
-                'connections': degree, 'size': calculated_size, 'node_type': 'bank',
-                'source_files': list(node_files.get(acc, [])),
-                'tag': app.node_tags.get(acc, '')
-            },
-            'classes': 'bank_node'
-        })
-
-    # Build low-activity group buckets, keyed by (hub, member_type)
-    group_buckets = defaultdict(lambda: {'members': [], 'total': 0})
-    for node in groupable:
-        hub = hub_for_node[node]
-        member_type = 'phone' if node in phone_counts else 'bank'
-        vol = phone_counts.get(node, 0) if member_type == 'phone' else bank_counts.get(node, 0)
-        bucket = group_buckets[(hub, member_type)]
-        bucket['members'].append(node)
-        bucket['total'] += vol
-
-    for (hub, member_type), bucket in group_buckets.items():
-        gid = f"group_{hub}_{member_type}"
-        noun = 'Contacts' if member_type == 'phone' else 'Accounts'
-        elements.append({
-            'data': {
-                'id': gid, 'node_type': 'group', 'member_type': member_type,
-                'group_count': len(bucket['members']), 'member_ids': bucket['members'],
-                'total_interactions': bucket['total'], 'connections': len(bucket['members']),
-                'size': min(20 + len(bucket['members']) * 2, 70),
-                'group_label': f"{len(bucket['members'])} Low-Activity {noun}"
+                'id': gid,
+                'node_type': 'group',
+                'member_type': ntype,
+                'group_count': count,
+                'member_ids': bucket['members'],
+                'total_interactions': bucket['total_interactions'],
+                'size': min(22 + (count * 2), 65),
+                'group_label': f"{count} Routine {'Calls' if ntype == 'phone' else 'Accounts'}"
             },
             'classes': 'group_node'
         })
         elements.append({
             'data': {
-                'id': f"{gid}_edge", 'source': hub, 'target': gid,
-                'weight': f"{len(bucket['members'])} grouped", 'numeric_weight': bucket['total'],
-                'arrow_mode': 'none', 'edge_type': 'group_link', 'is_top_3': False
+                'id': f"{gid}_edge",
+                'source': hub,
+                'target': gid,
+                'weight': f"{count} contacts",
+                'numeric_weight': bucket['total_interactions'],
+                'arrow_mode': 'none',
+                'edge_type': 'group_link',
+                'is_top_3': False
             },
             'classes': 'group_link_edge'
         })
 
-    # Edges between two normally-rendered nodes only (edges touching a
-    # grouped node are represented by the aggregate hub->group edge above).
-    displayable_edges = {
-        key: edata for key, edata in raw_edges.items()
-        if key[0] not in groupable and key[1] not in groupable
+    for i, row in enumerate(raw_edges):
+        u, v = str(row['pmin']), str(row['pmax'])
+        if u in rendered_node_ids and v in rendered_node_ids:
+            has_fwd, has_bwd = bool(row['has_fwd']), bool(row['has_bwd'])
+            arrow_mode = "both" if (has_fwd and has_bwd) else ("forward" if has_fwd else "backward")
+            display_label = f"₹{row['dur_sum']} ({row['weight']}tx)" if row['mode'] == 'bank' else f"{row['weight']} calls"
+
+            elements.append({
+                'data': {
+                    'id': f"edge_{i}",
+                    'source': u,
+                    'target': v,
+                    'weight': display_label,
+                    'numeric_weight': int(row['weight']),
+                    'arrow_mode': arrow_mode,
+                    'edge_type': 'financial' if row['mode'] == 'bank' else 'telecom',
+                    'is_top_3': False
+                },
+                'classes': 'financial_edge' if row['mode'] == 'bank' else 'telecom_edge'
+            })
+
+    for idx, (p, b) in enumerate(cross_edges):
+        if p in rendered_node_ids and b in rendered_node_ids:
+            elements.append({
+                'data': {
+                    'id': f"cross_tether_{idx}",
+                    'source': p,
+                    'target': b,
+                    'weight': 'LINKED ASSET',
+                    'arrow_mode': 'none',
+                    'edge_type': 'cross_link'
+                },
+                'classes': 'cross_link_edge'
+            })
+
+    conn.close()
+    return {
+        'elements': elements,
+        'files': [f['filename'] for f in mapped_files],
+        'meta': {
+            'rendered_elements': len(elements),
+            'total_nodes': len(rendered_node_ids),
+            'file_labels': file_labels
+        },
+        'analysis': {
+            'targets': [
+                {'filename': f['filename'], 'target': f['target_identity'] or 'Unidentified', 'mode': f['mode'] or 'phone', 'tag': node_tags.get(f['target_identity'], '')}
+                for f in mapped_files
+            ],
+            'bridges': analysis_bridges,
+            'top_calls': analysis_top_calls,
+            'top_durations': analysis_top_durations,
+            'linked_assets': [
+                {'phone': p, 'bank': b, 'phone_tag': node_tags.get(p, ''), 'bank_tag': node_tags.get(b, '')}
+                for p, b in cross_edges
+            ]
+        }
     }
 
-    top_3_edge_keys = set(sorted(displayable_edges.keys(), key=lambda k: displayable_edges[k]['total_weight'], reverse=True)[:3])
-
-    for i, (bi_key, edge_data) in enumerate(displayable_edges.items()):
-        node_a, node_b = bi_key
-        weight = edge_data['total_weight']
-        edge_type = edge_data['type']
-
-        has_a_to_b = edge_data['has_fwd']
-        has_b_to_a = edge_data['has_bwd']
-        arrow_mode = "both" if (has_a_to_b and has_b_to_a) else ("forward" if has_a_to_b else "backward")
-
-        display_label = f"₹{edge_data['label']} ({weight}tx)" if (edge_type == 'financial' and edge_data['label']) else f"{weight} calls"
-
-        is_top_3 = bi_key in top_3_edge_keys
-        edge_class = 'financial_edge' if edge_type == 'financial' else 'telecom_edge'
-        if is_top_3:
-            edge_class += ' top_edge_highlight'
-
-        elements.append({
-            'data': {
-                'id': f"edge_{i}", 'source': node_a, 'target': node_b,
-                'weight': display_label, 'numeric_weight': weight,
-                'arrow_mode': arrow_mode, 'edge_type': edge_type,
-                'is_top_3': is_top_3
-            },
-            'classes': edge_class
-        })
-
-    # Format Cross Links (phone <-> linked bank account) - never grouped
-    for idx, (ph_node, bk_node) in enumerate(cross_edges):
-        elements.append({
-            'data': {
-                'id': f"cross_tether_{idx}", 'source': ph_node, 'target': bk_node,
-                'weight': 'LINKED ASSET', 'arrow_mode': 'none', 'edge_type': 'cross_link'
-            },
-            'classes': 'cross_link_edge'
-        })
-
-    app.file_display_names = graph_data['file_display_names']
-
-    meta = {
-        'rendered_elements': len(elements),
-        'grouped_count': len(groupable),
-        'file_labels': app.file_display_names,
-        'warning': (
-            f"Graph has {len(elements)} elements - this may still be slow to render. "
-            f"Consider enabling/raising the low-activity grouping threshold."
-            if len(elements) > RENDER_WARNING_THRESHOLD else None
-        )
-    }
-
-    return elements, meta
-
-
-def get_existing_phone_numbers():
-    """Distinct (cleaned) phone numbers already staged, used to populate the link-to-suspect dropdown."""
-    phones = set()
-    for filename in app.global_active_files:
-        config = app.file_configs.get(filename)
-        df = app.cleaned_dfs.get(filename)
-        if df is None or not config or config.get('mode') != 'phone':
-            continue
-        src_col, tgt_col = config.get('source_col'), config.get('target_col')
-        if not src_col or not tgt_col or src_col not in df.columns or tgt_col not in df.columns:
-            continue
-        valid = _valid_phone_frame(df, src_col, tgt_col)
-        phones.update(valid[src_col].unique().tolist())
-        phones.update(valid[tgt_col].unique().tolist())
-    return sorted(phones)
-
+def _graph_response():
+    data = _compute_graph_and_analysis()
+    return jsonify({
+        'files': data['files'],
+        'graph': data['elements'],
+        'graph_meta': data['meta'],
+        'analysis': data['analysis']
+    })
 
 @app.route('/')
 def index():
     return render_template('index.html')
 
+@app.route('/clear-session', methods=['POST'])
+def clear_session():
+    init_db(clear_all=True)
+    return jsonify({'status': 'cleared'})
 
 @app.route('/upload', methods=['POST'])
 def upload_files():
@@ -590,195 +462,331 @@ def upload_files():
 
     uploaded_files = request.files.getlist('files')
     if not uploaded_files or uploaded_files[0].filename == '':
-        return jsonify({'error': 'No document selected for staging.'}), 400
+        return jsonify({'error': 'No document selected.'}), 400
 
     filenames = []
     auto_mappings = {}
     primary_headers = []
 
+    conn = get_db()
+    cursor = conn.cursor()
+
     try:
         for idx, file in enumerate(uploaded_files):
             if file and file.filename.endswith('.csv'):
-                stream = file.read().decode("utf-8", errors="ignore")
                 filename = file.filename
-
-                df = pd.read_csv(io.StringIO(stream), index_col=False, dtype=str)
-                df = clean_dataframe(df)
-
-                app.cleaned_dfs[filename] = df
                 filenames.append(filename)
 
+                cursor.execute("DELETE FROM raw_csv_rows WHERE filename = ?", (filename,))
+                cursor.execute("DELETE FROM files_meta WHERE filename = ?", (filename,))
+                cursor.execute("DELETE FROM normalized_records WHERE filename = ?", (filename,))
+
+                stream = io.StringIO(file.read().decode("utf-8", errors="ignore"))
+                reader = csv.reader(stream)
+                headers = next(reader, None)
+
+                if not headers:
+                    continue
+
+                headers = [str(h).strip() for h in headers if h]
+                cursor.execute("""
+                    INSERT INTO files_meta (filename, headers_json, is_mapped)
+                    VALUES (?, ?, 0)
+                """, (filename, json.dumps(headers)))
+
                 if idx == 0:
-                    auto_mappings = auto_detect_columns(df.columns.tolist())
-                    primary_headers = df.columns.tolist()
+                    primary_headers = headers
+                    auto_mappings = auto_detect_columns(headers)
+
+                insert_batch = []
+                for row in reader:
+                    if not row or not any(row):
+                        continue
+                    row_dict = {headers[i]: str(row[i]).strip() for i in range(min(len(headers), len(row)))}
+                    insert_batch.append((filename, json.dumps(row_dict)))
+
+                    if len(insert_batch) >= 5000:
+                        cursor.executemany("INSERT INTO raw_csv_rows (filename, row_json) VALUES (?, ?)", insert_batch)
+                        insert_batch = []
+
+                if insert_batch:
+                    cursor.executemany("INSERT INTO raw_csv_rows (filename, row_json) VALUES (?, ?)", insert_batch)
+
+        conn.commit()
+
+        cursor.execute("SELECT DISTINCT source FROM normalized_records WHERE mode = 'phone' UNION SELECT DISTINCT target FROM normalized_records WHERE mode = 'phone'")
+        existing_phones = [str(r[0]) for r in cursor.fetchall() if r[0] and len(str(r[0])) == 10]
+        conn.close()
 
         return jsonify({
             'filenames': filenames,
             'headers': primary_headers,
             'auto_mapping': auto_mappings,
-            'existing_phones': get_existing_phone_numbers(),
-            'grouping_config': app.grouping_config
+            'existing_phones': existing_phones
         })
     except Exception as e:
-        return jsonify({'error': f'Failed reading and cleaning CSV stream: {str(e)}'}), 500
+        conn.rollback()
+        conn.close()
+        return jsonify({'error': f'Failed reading CSV stream: {str(e)}'}), 500
 
+def _normalize_and_map_file(conn, filename, mode, src_col, tgt_col, dur_col, type_col, dt_col, time_col, linked_phone):
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM normalized_records WHERE filename = ?", (filename,))
+    cursor.execute("SELECT row_json FROM raw_csv_rows WHERE filename = ?", (filename,))
 
-def _graph_response():
-    """Common envelope builder: {'files': [...], 'graph': [...], 'graph_meta': {...}}"""
-    elements, meta = process_active_files_fast()
-    return jsonify({'files': app.global_active_files, 'graph': elements, 'graph_meta': meta})
+    norm_batch = []
+    counts = defaultdict(int)
+    first_src = None
 
+    while True:
+        rows = cursor.fetchmany(5000)
+        if not rows:
+            break
+
+        for r in rows:
+            row_data = json.loads(r['row_json'])
+            raw_s = (row_data.get(src_col) or '').strip()
+            raw_t = (row_data.get(tgt_col) or '').strip()
+
+            if not raw_s or not raw_t:
+                continue
+
+            if mode == 'phone':
+                u = clean_phone_str(raw_s)
+                v = clean_phone_str(raw_t)
+                if not u or not v:
+                    continue
+            else:
+                u, v = raw_s, raw_t
+                if first_src is None:
+                    first_src = u
+
+            counts[u] += 1
+            counts[v] += 1
+            dur_val = parse_float(row_data.get(dur_col)) if dur_col else 0.0
+
+            norm_batch.append((
+                filename, mode, u, v, dur_val,
+                row_data.get(type_col, '') if type_col else '',
+                row_data.get(dt_col, '') if dt_col else '',
+                row_data.get(time_col, '') if time_col else ''
+            ))
+
+        if len(norm_batch) >= 5000:
+            cursor.executemany("""
+                INSERT INTO normalized_records (filename, mode, source, target, duration, itype, idate, itime)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, norm_batch)
+            norm_batch = []
+
+    if norm_batch:
+        cursor.executemany("""
+            INSERT INTO normalized_records (filename, mode, source, target, duration, itype, idate, itime)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, norm_batch)
+
+    target_identity = max(counts, key=counts.get) if (mode == 'phone' and counts) else (first_src or '')
+
+    cursor.execute("""
+        UPDATE files_meta 
+        SET mode = ?, source_col = ?, target_col = ?, dur_col = ?, type_col = ?, 
+            dt_col = ?, time_col = ?, linked_phone = ?, target_identity = ?, is_mapped = 1
+        WHERE filename = ?
+    """, (mode, src_col, tgt_col, dur_col, type_col, dt_col, time_col, linked_phone, target_identity, filename))
 
 @app.route('/process-batch-mapping', methods=['POST'])
 def process_batch_mapping():
-    data = request.json
+    data = request.json or {}
     filenames = data.get('filenames', [])
+    mode = data.get('mode', 'phone')
+    src_col = data.get('source_col')
+    tgt_col = data.get('target_col')
+    dur_col = data.get('dur_col')
+    type_col = data.get('type_col')
+    dt_col = data.get('dt_col')
+    time_col = data.get('time_col')
+    linked_phone = data.get('linked_phone', 'none')
 
-    for filename in filenames:
-        app.file_configs[filename] = {
-            'mode': data.get('mode', 'phone'),
-            'source_col': data.get('source_col'),
-            'target_col': data.get('target_col'),
-            'dur_col': data.get('dur_col'),
-            'type_col': data.get('type_col'),
-            'dt_col': data.get('dt_col'),
-            'time_col': data.get('time_col'),
-            'linked_phone': data.get('linked_phone')
-        }
-        if filename not in app.global_active_files:
-            app.global_active_files.append(filename)
+    conn = get_db()
+    try:
+        for filename in filenames:
+            _normalize_and_map_file(conn, filename, mode, src_col, tgt_col, dur_col, type_col, dt_col, time_col, linked_phone)
+        conn.commit()
+        conn.close()
+        return _graph_response()
+    except Exception as e:
+        try:
+            conn.rollback()
+            conn.close()
+        except Exception:
+            pass
+        return jsonify({'error': f'Batch processing faulted: {str(e)}'}), 500
 
-    if 'group_enabled' in data:
-        app.grouping_config = {
-            'enabled': bool(data.get('group_enabled')),
-            'metric': data.get('group_metric', 'count'),
-            'threshold': data.get('group_threshold', 0),
-        }
+@app.route('/expand-member/<path:node_id>', methods=['GET'])
+def expand_member(node_id):
+    node_type = request.args.get('type', 'phone')
+    conn = get_db()
+    cursor = conn.cursor()
 
-    return _graph_response()
+    cursor.execute("""
+        SELECT COUNT(*) as total_cnt
+        FROM normalized_records
+        WHERE source = ? OR target = ?
+    """, (node_id, node_id))
+    total_interactions = int(cursor.fetchone()['total_cnt'] or 0)
 
+    cursor.execute("""
+        SELECT tag FROM node_tags WHERE node_id = ?
+    """, (node_id,))
+    tag_row = cursor.fetchone()
+    tag_val = tag_row['tag'] if tag_row else ''
+
+    cursor.execute("""
+        SELECT 
+            CASE WHEN source <= target THEN source ELSE target END AS pmin,
+            CASE WHEN source <= target THEN target ELSE source END AS pmax,
+            mode,
+            COUNT(*) AS weight,
+            COALESCE(SUM(duration), 0.0) AS dur_sum,
+            MAX(CASE WHEN source <= target THEN 1 ELSE 0 END) AS has_fwd,
+            MAX(CASE WHEN source > target THEN 1 ELSE 0 END) AS has_bwd
+        FROM normalized_records
+        WHERE source = ? OR target = ?
+        GROUP BY pmin, pmax, mode
+    """, (node_id, node_id))
+    raw_edges = cursor.fetchall()
+    conn.close()
+
+    degree = len(raw_edges)
+    is_phone = (node_type == 'phone')
+    size = min(22 + (degree * 4), 65) if is_phone else min(22 + (degree * 5), 70)
+    base_class = "phone_standard" if is_phone else "bank_node"
+
+    node_element = {
+        'data': {
+            'id': node_id,
+            'phone_number' if is_phone else 'account_number': node_id,
+            'total_interactions': total_interactions,
+            'connections': degree,
+            'size': size,
+            'node_type': node_type,
+            'linked_banks': [],
+            'tag': tag_val,
+            'flags': ['Unpacked from Routine Bucket']
+        },
+        'classes': f"{base_class}"
+    }
+
+    edge_elements = []
+    for i, row in enumerate(raw_edges):
+        u, v = str(row['pmin']), str(row['pmax'])
+        has_fwd, has_bwd = bool(row['has_fwd']), bool(row['has_bwd'])
+        arrow_mode = "both" if (has_fwd and has_bwd) else ("forward" if has_fwd else "backward")
+        display_label = f"₹{row['dur_sum']} ({row['weight']}tx)" if row['mode'] == 'bank' else f"{row['weight']} calls"
+
+        edge_elements.append({
+            'data': {
+                'id': f"expand_{node_id}_edge_{i}",
+                'source': u,
+                'target': v,
+                'weight': display_label,
+                'numeric_weight': int(row['weight']),
+                'arrow_mode': arrow_mode,
+                'edge_type': 'financial' if row['mode'] == 'bank' else 'telecom',
+                'is_top_3': False
+            },
+            'classes': 'financial_edge' if row['mode'] == 'bank' else 'telecom_edge'
+        })
+
+    return jsonify({'node': node_element, 'edges': edge_elements})
 
 @app.route('/node-details/<path:node_id>', methods=['GET'])
 def node_details(node_id):
     node_type = request.args.get('type', 'phone')
-    if node_type not in ('phone', 'bank'):
-        return jsonify({'error': 'Invalid node type.'}), 400
+    conn = get_db()
+    cursor = conn.cursor()
 
-    records, total = _lookup_node_records(node_id, node_type, MAX_LOGS_PER_NODE)
+    cursor.execute("""
+        SELECT source, target, duration, itype, idate, itime 
+        FROM normalized_records 
+        WHERE source = ? OR target = ? 
+        LIMIT ?
+    """, (node_id, node_id, MAX_LOGS_PER_NODE))
+    
+    rows = cursor.fetchall()
+
+    cursor.execute("SELECT COUNT(*) FROM normalized_records WHERE source = ? OR target = ?", (node_id, node_id))
+    total = int(cursor.fetchone()[0] or 0)
+    conn.close()
+
+    records = []
+    for r in rows:
+        rec = {
+            'from': r['source'],
+            'to': r['target'],
+            'date': r['idate'],
+            'time': r['itime']
+        }
+        if node_type == 'phone':
+            rec['type'] = r['itype']
+            rec['duration'] = r['duration']
+        else:
+            rec['amount'] = r['duration']
+        records.append(rec)
+
     return jsonify({'records': records, 'total': total})
-
-
-@app.route('/expand-member/<path:node_id>', methods=['GET'])
-def expand_member(node_id):
-    """
-    Pulls one specific node out of its low-activity group and returns its
-    real node + edge data (uncapped by the grouping decision), so an
-    investigator who spots something worth mapping in a grouped member's
-    records can bring it into the canvas individually.
-    """
-    node_type = request.args.get('type', 'phone')
-    if node_type not in ('phone', 'bank'):
-        return jsonify({'error': 'Invalid node type.'}), 400
-
-    graph_data = _compute_graph_data()
-    counts = graph_data['phone_counts'] if node_type == 'phone' else graph_data['bank_counts']
-    if node_id not in counts:
-        return jsonify({'error': 'Node not found.'}), 404
-
-    neighbor_sets = graph_data['neighbor_sets']
-    raw_edges = graph_data['raw_edges']
-    phone_to_bank_map = graph_data['phone_to_bank_map']
-
-    degree = len(neighbor_sets.get(node_id, ()))
-    node_files = graph_data['node_files']
-    if node_type == 'phone':
-        is_linked = node_id in phone_to_bank_map
-        node_elem = {
-            'data': {
-                'id': node_id, 'phone_number': node_id, 'total_interactions': counts[node_id],
-                'connections': degree, 'size': min(16 + (degree * 4), 60), 'node_type': 'phone',
-                'linked_banks': list(phone_to_bank_map[node_id]) if is_linked else [],
-                'source_files': list(node_files.get(node_id, [])),
-                'tag': app.node_tags.get(node_id, '')
-            },
-            'classes': "phone_orange" if is_linked else "phone_standard"
-        }
-    else:
-        node_elem = {
-            'data': {
-                'id': node_id, 'account_number': node_id, 'total_transactions': counts[node_id],
-                'connections': degree, 'size': min(18 + (degree * 5), 65), 'node_type': 'bank',
-                'source_files': list(node_files.get(node_id, [])),
-                'tag': app.node_tags.get(node_id, '')
-            },
-            'classes': 'bank_node'
-        }
-
-    edge_elems = []
-    for i, (bi_key, edata) in enumerate(raw_edges.items()):
-        if node_id not in bi_key:
-            continue
-        node_a, node_b = bi_key
-        weight = edata['total_weight']
-        arrow_mode = "both" if (edata['has_fwd'] and edata['has_bwd']) else ("forward" if edata['has_fwd'] else "backward")
-        display_label = f"₹{edata['label']} ({weight}tx)" if (edata['type'] == 'financial' and edata['label']) else f"{weight} calls"
-        edge_class = 'financial_edge' if edata['type'] == 'financial' else 'telecom_edge'
-        edge_elems.append({
-            'data': {
-                'id': f"expand_{node_id}_edge_{i}", 'source': node_a, 'target': node_b,
-                'weight': display_label, 'numeric_weight': weight,
-                'arrow_mode': arrow_mode, 'edge_type': edata['type'], 'is_top_3': False
-            },
-            'classes': edge_class
-        })
-
-    return jsonify({'node': node_elem, 'edges': edge_elems})
-
 
 @app.route('/tag/<path:node_id>', methods=['POST'])
 def set_tag(node_id):
-    """Assigns an investigator-chosen name/tag to a number or account (e.g.
-    'Suspect A', 'Mule Account 3'). Global across the case, like grouping."""
     data = request.json or {}
     tag = (data.get('tag') or '').strip()
+    conn = get_db()
+    cursor = conn.cursor()
     if tag:
-        app.node_tags[node_id] = tag
+        cursor.execute("INSERT OR REPLACE INTO node_tags (node_id, tag) VALUES (?, ?)", (node_id, tag))
     else:
-        app.node_tags.pop(node_id, None)
-    return jsonify({'node_id': node_id, 'tag': app.node_tags.get(node_id, '')})
-
+        cursor.execute("DELETE FROM node_tags WHERE node_id = ?", (node_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({'node_id': node_id, 'tag': tag})
 
 @app.route('/get-current-state', methods=['GET'])
 def get_current_state():
     return _graph_response()
 
-
 @app.route('/delete/<path:filename>', methods=['DELETE'])
 def delete_file(filename):
-    app.cleaned_dfs.pop(filename, None)
-    app.file_configs.pop(filename, None)
-    if filename in app.global_active_files:
-        app.global_active_files.remove(filename)
-
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM raw_csv_rows WHERE filename = ?", (filename,))
+    cursor.execute("DELETE FROM normalized_records WHERE filename = ?", (filename,))
+    cursor.execute("DELETE FROM files_meta WHERE filename = ?", (filename,))
+    conn.commit()
+    conn.close()
     return _graph_response()
-
 
 @app.route('/export-workspace', methods=['GET'])
 def export_workspace():
+    conn = get_db()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT * FROM files_meta WHERE is_mapped = 1")
+    meta_rows = [dict(row) for row in cursor.fetchall()]
+
+    cursor.execute("SELECT * FROM raw_csv_rows")
+    raw_rows = [dict(row) for row in cursor.fetchall()]
+
+    cursor.execute("SELECT * FROM node_tags")
+    tags = {str(row['node_id']): str(row['tag']) for row in cursor.fetchall()}
+    conn.close()
+
     bundle = {
-        'version': 1,
-        'active_files': app.global_active_files,
-        'file_configs': app.file_configs,
-        'grouping_config': app.grouping_config,
-        'node_tags': app.node_tags,
-        'datasets': {
-            filename: df.to_csv(index=False)
-            for filename, df in app.cleaned_dfs.items()
-            if filename in app.global_active_files
-        }
+        'version': 4,
+        'files_meta': meta_rows,
+        'raw_rows': raw_rows,
+        'node_tags': tags
     }
     return jsonify(bundle)
-
 
 @app.route('/import-workspace', methods=['POST'])
 def import_workspace():
@@ -789,25 +797,47 @@ def import_workspace():
         raw = request.files['workspace_file'].read().decode('utf-8', errors='ignore')
         bundle = json.loads(raw)
 
-        for filename, csv_text in bundle.get('datasets', {}).items():
-            df = pd.read_csv(io.StringIO(csv_text), index_col=False, dtype=str)
-            df = clean_dataframe(df)
-            app.cleaned_dfs[filename] = df
+        init_db(clear_all=True)
+        conn = get_db()
+        cursor = conn.cursor()
 
-        app.file_configs.update(bundle.get('file_configs', {}))
-        if 'grouping_config' in bundle:
-            app.grouping_config = bundle['grouping_config']
-        if 'node_tags' in bundle:
-            app.node_tags.update(bundle['node_tags'])
+        for meta in bundle.get('files_meta', []):
+            cursor.execute("""
+                INSERT INTO files_meta (filename, headers_json, mode, source_col, target_col, dur_col, type_col, dt_col, time_col, linked_phone, target_identity, is_mapped)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                meta['filename'], meta['headers_json'], meta['mode'], meta['source_col'], meta['target_col'],
+                meta['dur_col'], meta['type_col'], meta['dt_col'], meta['time_col'], meta['linked_phone'],
+                meta['target_identity'], meta['is_mapped']
+            ))
 
-        for filename in bundle.get('active_files', []):
-            if filename not in app.global_active_files:
-                app.global_active_files.append(filename)
+        raw_batch = [(r['filename'], r['row_json']) for r in bundle.get('raw_rows', [])]
+        if raw_batch:
+            cursor.executemany("INSERT INTO raw_csv_rows (filename, row_json) VALUES (?, ?)", raw_batch)
 
+        for nid, tag in bundle.get('node_tags', {}).items():
+            cursor.execute("INSERT INTO node_tags (node_id, tag) VALUES (?, ?)", (nid, tag))
+
+        for meta in bundle.get('files_meta', []):
+            if meta.get('is_mapped'):
+                _normalize_and_map_file(
+                    conn,
+                    meta['filename'],
+                    meta.get('mode', 'phone'),
+                    meta.get('source_col'),
+                    meta.get('target_col'),
+                    meta.get('dur_col'),
+                    meta.get('type_col'),
+                    meta.get('dt_col'),
+                    meta.get('time_col'),
+                    meta.get('linked_phone', 'none')
+                )
+
+        conn.commit()
+        conn.close()
         return _graph_response()
     except Exception as e:
         return jsonify({'error': f'Failed to restore workspace: {str(e)}'}), 500
-
 
 if __name__ == '__main__':
     app.run(debug=True, port=80)

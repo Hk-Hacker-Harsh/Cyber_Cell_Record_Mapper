@@ -4,10 +4,14 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Cyber Cell Record Mapper</title>
+    <!-- Cytoscape Core + fCoSE Layout Extension -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.26.0/cytoscape.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/layout-base/layout-base.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/cose-base/cose-base.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/cytoscape-fcose/cytoscape-fcose.js"></script>
     <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+    
     <style>
-        
         * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', sans-serif; }
         body { display: flex; height: 100vh; overflow: hidden; background-color: #0b132b; color: #ffffff; }
 
@@ -25,17 +29,39 @@
         .file-item { display: flex; justify-content: space-between; align-items: center; background: #0b132b; padding: 10px 12px; border-radius: 4px; margin-bottom: 8px; border-left: 3px solid #5bc0be; font-size: 0.85rem; }
         .delete-btn { background: transparent; border: none; color: #ff5555; cursor: pointer; font-weight: bold; font-size: 1.1rem; }
         .align-btn { background: #5bc0be; color: #0b132b; border: none; padding: 12px; border-radius: 6px; font-weight: bold; cursor: pointer; text-transform: uppercase; margin-bottom: 15px; }
-        
+
         .workspace-terminal-actions { border-top: 1px solid #3a506b; padding-top: 15px; display: flex; flex-direction: column; gap: 8px; }
         .btn-backup-export { background: #06d6a0; color: #0b132b; border: none; padding: 10px; border-radius: 4px; font-weight: bold; cursor: pointer; text-align: center; font-size: 0.8rem; text-transform: uppercase;}
         .btn-backup-import { background: transparent; border: 1px solid #00b4d8; color: #00b4d8; padding: 10px; border-radius: 4px; font-weight: bold; cursor: pointer; text-align: center; font-size: 0.8rem; text-transform: uppercase;}
 
-        #workspace { flex-grow: 1; height: 100vh; position: relative; background-color: #0b132b; }
-        #placeholder { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); text-align: center; color: #3a506b; pointer-events: none; z-index: 1; }
-        #cy { width: 100%; height: 100%; position: absolute; top: 0; left: 0; z-index: 2; }
+        #workspace { flex-grow: 1; height: 100vh; position: relative; background-color: #0b132b; display: flex; flex-direction: column; }
+        #placeholder { position: absolute; top: 40%; left: 50%; transform: translate(-50%, -50%); text-align: center; color: #3a506b; pointer-events: none; z-index: 1; }
+        #cy { width: 100%; height: calc(100% - 220px); position: relative; z-index: 2; }
+        #sankey-container { width: 100%; height: calc(100% - 220px); position: absolute; top: 0; left: 0; z-index: 2; display: none; background: #0b132b; }
+
+        /* Bottom Forensic Analysis Section */
+        #analysis-drawer {
+            height: 220px; width: 100%; background: #141c33; border-top: 2px solid #3a506b;
+            display: flex; flex-direction: column; z-index: 5; box-shadow: 0 -4px 15px rgba(0,0,0,0.4);
+        }
+        #analysis-drawer-header {
+            background: #1c2541; padding: 8px 16px; font-size: 0.85rem; font-weight: bold;
+            color: #5bc0be; text-transform: uppercase; letter-spacing: 0.5px;
+            display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #3a506b;
+        }
+        #analysis-grid {
+            display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; padding: 12px 16px;
+            overflow-y: auto; flex-grow: 1; font-size: 0.8rem;
+        }
+        .analysis-card { background: #0b132b; border: 1px solid #3a506b; border-radius: 6px; padding: 10px; overflow-y: auto; max-height: 160px; }
+        .analysis-card h5 { color: #ffe14d; margin-bottom: 6px; font-size: 0.8rem; text-transform: uppercase; border-bottom: 1px solid #2a3a5c; padding-bottom: 4px; }
+        .analysis-item { display: flex; justify-content: space-between; padding: 3px 0; border-bottom: 1px dashed #1c2541; cursor: pointer; }
+        .analysis-item:hover { background: rgba(91, 192, 190, 0.1); }
+        .analysis-item span { color: #fff; }
+        .analysis-item .badge { font-weight: bold; }
 
         #details-card {
-            position: absolute; top: 20px; right: -460px; width: 420px; max-height: calc(100vh - 40px);
+            position: absolute; top: 20px; right: -460px; width: 420px; max-height: calc(100vh - 260px);
             background: rgba(28, 37, 65, 0.98); border: 1px solid #3a506b; border-radius: 8px;
             padding: 20px; z-index: 100; box-shadow: -5px 5px 20px rgba(0,0,0,0.5);
             transition: right 0.4s ease; overflow-y: auto;
@@ -46,9 +72,24 @@
         #details-card p { font-size: 0.9rem; margin-bottom: 6px; }
         .close-card-btn { position: absolute; top: 10px; right: 15px; background: transparent; border: none; color: #a5a5a5; font-size: 1.2rem; cursor: pointer; }
         
+        .badge-list { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 10px; }
+        .flag-badge { background: #ff4d6d; color: #fff; padding: 2px 8px; border-radius: 12px; font-size: 0.72rem; font-weight: bold; }
+        .flag-badge.top-dur { background: #f77f00; }
+        .flag-badge.top-vol { background: #ff0054; }
+
         .log-table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 0.8rem; }
         .log-table th, .log-table td { border: 1px solid #3a506b; padding: 6px; text-align: left; }
         .log-table th { background: #0b132b; color: #5bc0be; }
+
+        .unpack-btn {
+            background: #5bc0be; border: none; color: #0b132b; padding: 4px 10px;
+            border-radius: 4px; font-size: 0.75rem; font-weight: bold; cursor: pointer;
+            transition: all 0.2s ease;
+        }
+        .unpack-btn:hover {
+            background: #ffe14d;
+            box-shadow: 0 0 8px rgba(255, 225, 77, 0.4);
+        }
 
         #mapping-modal {
             display: none; position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
@@ -73,14 +114,11 @@
         .pill-box { display: flex; flex-wrap: wrap; gap: 8px; min-height: 50px; }
         .drag-pill { background: #3a506b; color: #fff; padding: 6px 12px; border-radius: 4px; font-size: 0.8rem; cursor: grab; user-select: none; }
 
-        #grouping-zone { background: #2a3a5c; padding: 12px; border-radius: 6px; margin-top: 15px; }
-        #grouping-controls { display: grid; grid-template-columns: auto auto; gap: 10px; }
-
         .modal-actions { margin-top: 20px; display: flex; justify-content: flex-end; gap: 10px; }
         .btn-secondary { background: transparent; border: 1px solid #3a506b; color: #fff; padding: 8px 16px; border-radius: 4px; cursor: pointer; }
         .btn-primary { background: #5bc0be; border: none; color: #0b132b; padding: 8px 16px; border-radius: 4px; cursor: pointer; font-weight: bold; }
 
-        #filter-widget { position: fixed; bottom: 20px; right: 20px; z-index: 1000; background: #1e1e2e; color: #fff; border-radius: 8px; box-shadow: 0 4px 15px rgba(0,0,0,0.4); font-family: sans-serif; width: 240px; max-height: calc(100vh - 40px); overflow-y: auto; }
+        #filter-widget { position: fixed; top: 20px; right: 20px; z-index: 1000; background: #1e1e2e; color: #fff; border-radius: 8px; box-shadow: 0 4px 15px rgba(0,0,0,0.4); font-family: sans-serif; width: 250px; max-height: calc(100vh - 280px); overflow-y: auto; }
         #filter-widget-header { display: flex; justify-content: space-between; align-items: center; padding: 12px 15px; cursor: pointer; }
         #filter-widget-header h4 { margin: 0; font-size: 14px; }
         #filter-widget-body { padding: 0 15px 15px 15px; }
@@ -97,8 +135,6 @@
         .view-toggle-btn { flex: 1; background: #0b132b; border: 1px solid #3a506b; color: #a5a5a5; padding: 8px; border-radius: 4px; cursor: pointer; font-size: 0.75rem; font-weight: 600; }
         .view-toggle-btn.active { background: #5bc0be; color: #0b132b; border-color: #5bc0be; }
 
-        #sankey-container { width: 100%; height: 100%; position: absolute; top: 0; left: 0; z-index: 2; display: none; background: #0b132b; }
-
         .file-name-block { display: flex; flex-direction: column; overflow: hidden; }
         .file-friendly-name { font-weight: 600; }
         .file-raw-name { font-size: 0.7rem; color: #6b7d94; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -112,26 +148,14 @@
     </style>
 </head>
 <body>
-    <!-- Bottom-Right Collapsible Filter Widget -->
     <div id="filter-widget" class="collapsed">
         <div id="filter-widget-header" onclick="toggleFilterWidget()">
             <h4>🔍 Filters & Layout</h4>
             <span class="filter-chevron">▾</span>
         </div>
         <div id="filter-widget-body">
-            <label class="filter-section-title" style="display:block; color:#a5a5a5; text-transform:uppercase;">Search / Highlight</label>
-            <input type="text" id="search-highlight-input" placeholder="Number or tag..." oninput="applyGraphFilters()">
-
-            <label class="filter-label">
-                <input type="checkbox" id="filter-low" checked onchange="applyGraphFilters()">
-                Calls / Txns &lt; 100
-            </label>
-            <label class="filter-label">
-                <input type="checkbox" id="filter-high" checked onchange="applyGraphFilters()">
-                Calls / Txns &ge; 100
-            </label>
-
-            <hr style="border: 0; border-top: 1px solid #333; margin: 8px 0;">
+            <label class="filter-section-title" style="display:block; color:#a5a5a5; text-transform:uppercase;">Search & Zoom (Press Enter)</label>
+            <input type="text" id="search-highlight-input" placeholder="Enter number & press Enter..." oninput="applyGraphFilters()" onkeydown="handleSearchKey(event)">
 
             <label class="filter-label">
                 <input type="checkbox" id="filter-phone" checked onchange="applyGraphFilters()">
@@ -142,13 +166,11 @@
                 Show Bank Nodes
             </label>
             <label class="filter-label">
-                <input type="checkbox" id="filter-groups" checked onchange="applyGraphFilters()">
-                Show Grouped Summary Nodes
+                <input type="checkbox" id="filter-purple" checked onchange="applyGraphFilters()">
+                Show Non-Visible Routine (Purple)
             </label>
-            <label class="filter-label">
-                <input type="checkbox" id="filter-linked-only" onchange="applyGraphFilters()">
-                Linked/Flagged Nodes Only
-            </label>
+
+            <hr style="border: 0; border-top: 1px solid #333; margin: 8px 0;">
 
             <label class="filter-label" style="display:flex; align-items:center; gap:6px;">
                 Min Connections &ge;
@@ -159,14 +181,15 @@
 
             <label style="display: block; margin-bottom: 4px; font-size: 12px;">🗺️ Diagram Layout</label>
             <select id="layout-selector" onchange="changeLayout(this.value)" style="width: 100%; background: #0b132b; color: #fff; border: 1px solid #3a506b; padding: 6px; border-radius: 4px; font-size: 12px;">
-                <option value="cose">Force-Directed (default)</option>
-                <option value="circle">Circle</option>
-                <option value="concentric">Concentric (by connections)</option>
-                <option value="grid">Grid</option>
+                <option value="fcose">fCoSE (Wide Cluster Spread)</option>
+                <option value="concentric">Concentric (Tiered Hierarchy)</option>
                 <option value="breadthfirst">Hierarchical (Tree)</option>
+                <option value="circle">Circle</option>
+                <option value="grid">Grid</option>
             </select>
         </div>
     </div>
+
     <div id="sidebar">
         <h2>Record Mapper</h2>
         <div class="upload-section">
@@ -193,10 +216,36 @@
     <div id="workspace">
         <div id="placeholder">
             <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path><polyline points="3.27 6.96 12 12.01 20.73 6.96"></polyline><line x1="12" y1="22.08" x2="12" y2="12"></line></svg>
-            <p>Upload files to initialize network visualization mapping</p>
+            <p>Upload files to initialize suspicion-filtered network map</p>
         </div>
         <div id="cy"></div>
         <div id="sankey-container"></div>
+
+        <!-- Bottom Forensic Intelligence Dashboard -->
+        <div id="analysis-drawer">
+            <div id="analysis-drawer-header">
+                <span>📊 Forensic Intelligence & Suspicion Analysis (Ascending: Low → High)</span>
+                <span id="analysis-summary-pill" style="color: #a5a5a5; font-size: 0.75rem;">Awaiting Data</span>
+            </div>
+            <div id="analysis-grid">
+                <div class="analysis-card" id="card-targets">
+                    <h5>🎯 Primary Suspects / Targets</h5>
+                    <div id="analysis-target-list"><p style="color:#666;">None</p></div>
+                </div>
+                <div class="analysis-card" id="card-bridges">
+                    <h5>🌉 Cross-CDR Bridges (Low → High)</h5>
+                    <div id="analysis-bridge-list"><p style="color:#666;">None</p></div>
+                </div>
+                <div class="analysis-card" id="card-top-calls">
+                    <h5>📞 Top 3 Calls per CDR (Low → High)</h5>
+                    <div id="analysis-topcalls-list"><p style="color:#666;">None</p></div>
+                </div>
+                <div class="analysis-card" id="card-top-dur">
+                    <h5>⏳ Top 5 Duration per CDR (Low → High)</h5>
+                    <div id="analysis-topdur-list"><p style="color:#666;">None</p></div>
+                </div>
+            </div>
+        </div>
 
         <div id="details-card">
             <button class="close-card-btn" onclick="closeDetails()">&times;</button>
@@ -251,26 +300,6 @@
                 <div class="pill-box" id="modal-pillbox"></div>
             </div>
 
-            <div id="grouping-zone">
-                <label style="display:flex; align-items:center; gap:8px; cursor:pointer; margin-bottom:10px;">
-                    <input type="checkbox" id="group-enabled-toggle" onchange="toggleGroupingUI()">
-                    <strong>Group Low-Activity Contacts</strong>
-                </label>
-                <div id="grouping-controls" style="display:none; gap:10px; align-items:center;">
-                    <select id="group-metric-select" style="background:#0b132b; color:#fff; border:1px solid #3a506b; padding:6px; border-radius:4px;">
-                        <option value="count">Calls / Txns less than</option>
-                        <option value="duration">Total Duration (min) less than</option>
-                    </select>
-                    <input type="number" id="group-threshold-input" min="1" placeholder="e.g. 5" style="background:#0b132b; color:#fff; border:1px solid #3a506b; padding:6px; border-radius:4px; width:100px;">
-                    <p style="font-size:0.72rem; color:#a5a5a5; margin-top:8px; grid-column: 1 / -1;">
-                        Nodes below the threshold on ALL their connections get collapsed into one summary node
-                        (dramatically reduces graph size on large batches). Linked/flagged nodes are never grouped.
-                        Duration metric only applies to telecom edges and assumes the duration column is in seconds.
-                        This is a graph-wide setting.
-                    </p>
-                </div>
-            </div>
-
             <div class="modal-actions">
                 <button class="btn-secondary" onclick="cancelMapping()">Cancel</button>
                 <button class="btn-primary" onclick="submitMapping()">Process Batch</button>
@@ -281,16 +310,25 @@
     <script>
         let cyInstance = null;
         let batchTargetFiles = [];
+        let hiddenFiles = new Set();
+        let currentView = 'network';
+        let currentLayoutName = 'fcose';
+
+        async function parseJsonResponse(res) {
+            const text = await res.text();
+            try {
+                return JSON.parse(text);
+            } catch (e) {
+                throw new Error("Server error (" + res.status + "): " + text.slice(0, 300));
+            }
+        }
 
         window.addEventListener('DOMContentLoaded', () => {
-            fetch('/get-current-state')
-            .then(res => res.json())
-            .then(data => {
-                if(data.files && data.files.length > 0) {
-                    updateUI(data);
-                }
-            })
-            .catch(err => console.error("Error pulling session state:", err));
+            fetch('/clear-session', { method: 'POST' })
+            .then(() => fetch('/get-current-state'))
+            .then(parseJsonResponse)
+            .then(data => updateUI(data))
+            .catch(err => console.error("Error initializing session:", err));
         });
 
         function toggleModeUI(mode) {
@@ -321,19 +359,20 @@
             }
 
             fetch('/upload', { method: 'POST', body: formData })
-            .then(res => res.json())
+            .then(parseJsonResponse)
             .then(data => {
                 if(data.error) alert(data.error);
                 else openMappingModal(data);
-            });
+            })
+            .catch(err => alert("Upload error: " + err.message));
             this.value = '';
         });
 
         function openMappingModal(data) {
-            batchTargetFiles = data.filenames;
+            batchTargetFiles = data.filenames || [];
             const selectEl = document.getElementById('phone-target-selector');
             selectEl.innerHTML = '<option value="none">-- Unlinked (Independent Graph Layer) --</option>';
-            data.existing_phones.forEach(p => {
+            (data.existing_phones || []).forEach(p => {
                 selectEl.innerHTML += `<option value="${p}">${p}</option>`;
             });
 
@@ -346,7 +385,7 @@
             document.getElementById('src-dz').innerHTML = "Drop Here";
             document.getElementById('tgt-dz').innerHTML = "Drop Here";
 
-            data.headers.forEach((h, i) => {
+            (data.headers || []).forEach((h, i) => {
                 const p = document.createElement('div');
                 p.className = 'drag-pill'; p.innerText = h; p.setAttribute('draggable', 'true'); p.setAttribute('id', `p-${i}`);
                 p.addEventListener('dragstart', (e) => { e.dataTransfer.setData('text', e.target.innerText); });
@@ -366,8 +405,6 @@
             toggleModeUI('phone');
             document.querySelector('input[name="record-type"][value="phone"]').checked = true;
 
-            // Auto-fill drop zones from the backend's column-name-based suggestion,
-            // so the investigator only needs to drag-drop when it guessed wrong.
             const zoneByKey = { source_col: 'src-dz', target_col: 'tgt-dz', dur_col: 'dur-dz', type_col: 'type-dz', dt_col: 'dt-dz', time_col: 'time-dz' };
             const am = data.auto_mapping || {};
             Object.keys(zoneByKey).forEach(key => {
@@ -378,18 +415,7 @@
                 zone.setAttribute('data-val', val);
             });
 
-            const gc = data.grouping_config || { enabled: false, metric: 'count', threshold: 0 };
-            document.getElementById('group-enabled-toggle').checked = !!gc.enabled;
-            document.getElementById('group-metric-select').value = gc.metric || 'count';
-            document.getElementById('group-threshold-input').value = gc.threshold || '';
-            toggleGroupingUI();
-
             document.getElementById('mapping-modal').style.display = 'flex';
-        }
-
-        function toggleGroupingUI() {
-            const enabled = document.getElementById('group-enabled-toggle').checked;
-            document.getElementById('grouping-controls').style.display = enabled ? 'grid' : 'none';
         }
 
         function cancelMapping() { document.getElementById('mapping-modal').style.display = 'none'; }
@@ -399,12 +425,12 @@
             const src = document.getElementById('src-dz').getAttribute('data-val');
             const tgt = document.getElementById('tgt-dz').getAttribute('data-val');
             
-            if(!src || !tgt) { alert("Source and Target fields are mandatory properties."); return; }
+            if(!src || !tgt) { alert("Source and Target fields are mandatory."); return; }
 
             const submitBtn = document.querySelector('#mapping-modal .btn-primary');
             const originalLabel = submitBtn.innerText;
             submitBtn.disabled = true;
-            submitBtn.innerText = "Processing...";
+            submitBtn.innerText = "Analyzing Suspicion...";
 
             fetch('/process-batch-mapping', {
                 method: 'POST',
@@ -415,27 +441,26 @@
                     type_col: document.getElementById('type-dz').getAttribute('data-val'),
                     dt_col: document.getElementById('dt-dz').getAttribute('data-val'),
                     time_col: document.getElementById('time-dz').getAttribute('data-val'),
-                    linked_phone: document.getElementById('phone-target-selector').value,
-                    group_enabled: document.getElementById('group-enabled-toggle').checked,
-                    group_metric: document.getElementById('group-metric-select').value,
-                    group_threshold: parseFloat(document.getElementById('group-threshold-input').value) || 0
+                    linked_phone: document.getElementById('phone-target-selector').value
                 })
             })
-            .then(res => res.json())
+            .then(parseJsonResponse)
             .then(data => {
                 submitBtn.disabled = false;
                 submitBtn.innerText = originalLabel;
+                if (data.error) {
+                    alert("Batch error: " + data.error);
+                    return;
+                }
                 document.getElementById('mapping-modal').style.display = 'none';
                 updateUI(data);
             })
             .catch(err => {
                 submitBtn.disabled = false;
                 submitBtn.innerText = originalLabel;
-                alert("Batch processing faulted: " + err);
+                alert("Batch processing faulted: " + err.message);
             });
         }
-
-        let currentView = 'network';
 
         function switchView(view) {
             currentView = view;
@@ -449,22 +474,19 @@
         function nodeDisplayLabel(n) {
             const tag = n.data('tag');
             const id = n.data('id');
-            if (n.data('node_type') === 'group') return n.data('group_label');
+            if (n.data('node_type') === 'purple_aggregate' || n.data('node_type') === 'group') return n.data('group_label') || n.data('label');
             return tag ? `${tag} (${id})` : id;
         }
 
         function renderSankey() {
             if (!cyInstance || typeof Plotly === 'undefined') return;
 
-            // Build the flow from whatever is CURRENTLY visible on the network
-            // view, so Sankey respects the same filters/grouping the
-            // investigator has already set up.
             const visibleNodes = cyInstance.nodes().filter(n => n.style('display') !== 'none');
             const visibleEdges = cyInstance.edges().filter(e => e.style('display') !== 'none' && e.data('edge_type') !== 'cross_link');
 
             if (visibleNodes.length === 0 || visibleEdges.length === 0) {
                 Plotly.purge('sankey-container');
-                document.getElementById('sankey-container').innerHTML = '<p style="color:#a5a5a5; text-align:center; padding-top:40px; font-family:sans-serif;">No flow to display - adjust filters or map more records.</p>';
+                document.getElementById('sankey-container').innerHTML = '<p style="color:#a5a5a5; text-align:center; padding-top:40px; font-family:sans-serif;">No suspicious flow to display - adjust filters or map more records.</p>';
                 return;
             }
 
@@ -475,7 +497,20 @@
                 idToIndex[n.id()] = i;
                 labels.push(nodeDisplayLabel(n));
                 const nt = n.data('node_type');
-                colors.push(nt === 'bank' ? '#ff4d6d' : (nt === 'group' ? '#7b2ff7' : (n.hasClass('phone_orange') ? '#ffaa00' : '#5bc0be')));
+                
+                if (nt === 'bank') {
+                    colors.push('#ff4d6d');
+                } else if (nt === 'purple_aggregate' || nt === 'group') {
+                    colors.push('#9d4edd');
+                } else if (n.hasClass('role_main_target')) {
+                    colors.push('#ffd166');
+                } else if (n.hasClass('role_bridge_node')) {
+                    colors.push('#00b4d8');
+                } else if (n.hasClass('phone_orange')) {
+                    colors.push('#ffaa00');
+                } else {
+                    colors.push('#5bc0be');
+                }
             });
 
             const source = [], target = [], value = [], linkColor = [];
@@ -484,7 +519,7 @@
                 if (s === undefined || t === undefined) return;
                 source.push(s); target.push(t);
                 value.push(Math.max(e.data('numeric_weight') || 1, 1));
-                linkColor.push(e.data('edge_type') === 'financial' ? 'rgba(6,214,160,0.4)' : 'rgba(91,192,190,0.4)');
+                linkColor.push(e.data('edge_type') === 'financial' ? 'rgba(6,214,160,0.4)' : (e.data('edge_type') === 'group_link' || e.data('edge_type') === 'purple_link' ? 'rgba(157,78,221,0.3)' : 'rgba(91,192,190,0.4)'));
             });
 
             const data = [{
@@ -512,12 +547,13 @@
         }
 
         function deleteFile(filename) {
-            fetch(`/delete/${filename}`, { method: 'DELETE' }).then(res => res.json()).then(data => { updateUI(data); closeDetails(); });
+            fetch(`/delete/${encodeURIComponent(filename)}`, { method: 'DELETE' })
+            .then(parseJsonResponse)
+            .then(data => { updateUI(data); closeDetails(); })
+            .catch(err => alert("Delete error: " + err.message));
         }
 
         function closeDetails() { document.getElementById('details-card').classList.remove('active'); }
-
-        let hiddenFiles = new Set();
 
         function toggleFileVisibility(filename) {
             if (hiddenFiles.has(filename)) hiddenFiles.delete(filename);
@@ -529,12 +565,97 @@
 
         function cssEscape(s) { return s.replace(/[^a-zA-Z0-9_-]/g, '_'); }
 
+        function focusOnNode(nodeId) {
+            if (!cyInstance) return;
+            const targetNode = cyInstance.getElementById(nodeId);
+            if (targetNode.length > 0) {
+                targetNode.style('display', 'element');
+                cyInstance.animate({
+                    center: { eles: targetNode },
+                    zoom: 2.2,
+                    duration: 500
+                });
+                renderNodeDetails(targetNode.data());
+            }
+        }
+
+        function handleSearchKey(event) {
+            if (event.key === 'Enter') {
+                const query = event.target.value.trim().toLowerCase();
+                if (!query || !cyInstance) return;
+
+                const matches = cyInstance.nodes().filter(n => {
+                    const id = String(n.data('id') || '').toLowerCase();
+                    const tag = String(n.data('tag') || '').toLowerCase();
+                    return id.includes(query) || tag.includes(query);
+                });
+
+                if (matches.length > 0) {
+                    const target = matches[0];
+                    focusOnNode(target.id());
+                } else {
+                    alert("No node found matching: " + query);
+                }
+            }
+        }
+
+        function expandMember(nodeId, memberType, groupNodeId) {
+            fetch(`/expand-member/${encodeURIComponent(nodeId)}?type=${memberType}`)
+            .then(parseJsonResponse)
+            .then(data => {
+                if (data.error) { alert(data.error); return; }
+                if (!cyInstance) return;
+
+                // 1. Add the extracted node to the canvas if not already present
+                if (cyInstance.getElementById(nodeId).length === 0) {
+                    cyInstance.add(data.node);
+                }
+
+                // 2. Connect individual communication edges to existing canvas nodes
+                data.edges.forEach(edgeEl => {
+                    const src = edgeEl.data.source, tgt = edgeEl.data.target;
+                    if (cyInstance.getElementById(src).length > 0 && cyInstance.getElementById(tgt).length > 0
+                        && cyInstance.getElementById(edgeEl.data.id).length === 0) {
+                        cyInstance.add(edgeEl);
+                    }
+                });
+
+                // 3. Decrement bucket counter or remove it if all members are unpacked
+                if (groupNodeId) {
+                    const groupNode = cyInstance.getElementById(groupNodeId);
+                    if (groupNode.length > 0) {
+                        let memberIds = groupNode.data('member_ids') || [];
+                        memberIds = memberIds.filter(id => id !== nodeId);
+                        groupNode.data('member_ids', memberIds);
+                        groupNode.data('group_count', memberIds.length);
+                        
+                        const noun = memberType === 'phone' ? 'Calls' : 'Accounts';
+                        groupNode.data('group_label', `${memberIds.length} Routine ${noun}`);
+
+                        if (memberIds.length === 0) {
+                            cyInstance.remove(groupNode);
+                        }
+                    }
+                }
+
+                // 4. Highlight, pan, and open its detailed communication dossier
+                applyGraphFilters();
+                focusOnNode(nodeId);
+            })
+            .catch(err => alert("Failed to extract node: " + err.message));
+        }
+
         function updateUI(data) {
-            const listContainer = document.getElementById('file-list'); listContainer.innerHTML = '';
+            if (!data || !data.files) {
+                if (data && data.error) alert(data.error);
+                return;
+            }
+            const listContainer = document.getElementById('file-list'); 
+            listContainer.innerHTML = '';
             if(data.files.length === 0) {
                 document.getElementById('placeholder').style.display = 'block';
                 if(cyInstance) { cyInstance.destroy(); cyInstance = null; }
-                removeGraphWarning();
+                renderAnalysisDashboard(null);
                 return;
             }
             document.getElementById('placeholder').style.display = 'none';
@@ -554,37 +675,66 @@
                 </li>`;
             });
             renderGraph(data.graph);
-            showGraphWarning(data.graph_meta);
+            renderAnalysisDashboard(data.analysis);
         }
 
-        function removeGraphWarning() {
-            const el = document.getElementById('graph-warning-banner');
-            if (el) el.remove();
-        }
+        function renderAnalysisDashboard(analysis) {
+            if (!analysis) {
+                document.getElementById('analysis-summary-pill').innerText = 'Awaiting Data';
+                document.getElementById('analysis-target-list').innerHTML = '<p style="color:#666;">None</p>';
+                document.getElementById('analysis-bridge-list').innerHTML = '<p style="color:#666;">None</p>';
+                document.getElementById('analysis-topcalls-list').innerHTML = '<p style="color:#666;">None</p>';
+                document.getElementById('analysis-topdur-list').innerHTML = '<p style="color:#666;">None</p>';
+                return;
+            }
 
-        function showGraphWarning(meta) {
-            removeGraphWarning();
-            if (!meta || !meta.warning) return;
-            const banner = document.createElement('div');
-            banner.id = 'graph-warning-banner';
-            banner.style.cssText = 'position:absolute; top:20px; left:50%; transform:translateX(-50%); background:#5c1a1a; color:#ffb3b3; border:1px solid #ff5555; padding:10px 16px; border-radius:6px; font-size:12px; z-index:500; max-width:500px; text-align:center;';
-            banner.innerText = '⚠️ ' + meta.warning;
-            document.getElementById('workspace').appendChild(banner);
+            document.getElementById('analysis-summary-pill').innerText = `Active Scrutiny: ${analysis.targets.length} Target(s) | ${analysis.bridges.length} Cross-Bridge(s)`;
+
+            let tHtml = '';
+            analysis.targets.forEach(t => {
+                const tagStr = t.tag ? ` (${t.tag})` : '';
+                tHtml += `<div class="analysis-item" onclick="focusOnNode('${t.target}')"><span><strong>${t.target}</strong>${tagStr}</span><span class="badge" style="color:#ffd166;">${t.mode.toUpperCase()}</span></div>`;
+            });
+            document.getElementById('analysis-target-list').innerHTML = tHtml || '<p style="color:#666;">None</p>';
+
+            let bHtml = '';
+            const sortedBridges = [...(analysis.bridges || [])].sort((a, b) => a.total_interactions - b.total_interactions);
+            sortedBridges.forEach(b => {
+                const tagStr = b.tag ? ` (${b.tag})` : '';
+                bHtml += `<div class="analysis-item" onclick="focusOnNode('${b.entity}')"><span><strong>${b.entity}</strong>${tagStr}</span><span class="badge" style="color:#00b4d8;">${b.file_count} Files (${b.total_interactions}tx)</span></div>`;
+            });
+            document.getElementById('analysis-bridge-list').innerHTML = bHtml || '<p style="color:#666;">No Multi-CDR Bridge</p>';
+
+            let cHtml = '';
+            const sortedCalls = [...(analysis.top_calls || [])].sort((a, b) => a.calls - b.calls);
+            sortedCalls.forEach(c => {
+                const tagStr = c.tag ? ` (${c.tag})` : '';
+                cHtml += `<div class="analysis-item" onclick="focusOnNode('${c.contact}')"><span>${c.contact}${tagStr}</span><span class="badge" style="color:#ff0054;">${c.calls} calls</span></div>`;
+            });
+            document.getElementById('analysis-topcalls-list').innerHTML = cHtml || '<p style="color:#666;">None</p>';
+
+            let dHtml = '';
+            const sortedDur = [...(analysis.top_durations || [])].sort((a, b) => a.duration_sec - b.duration_sec);
+            sortedDur.forEach(d => {
+                const tagStr = d.tag ? ` (${d.tag})` : '';
+                dHtml += `<div class="analysis-item" onclick="focusOnNode('${d.contact}')"><span>${d.contact}${tagStr}</span><span class="badge" style="color:#f77f00;">${d.duration_sec}s</span></div>`;
+            });
+            document.getElementById('analysis-topdur-list').innerHTML = dHtml || '<p style="color:#666;">None</p>';
         }
 
         function exportForensicWorkspace() {
             fetch('/export-workspace')
-            .then(res => res.json())
+            .then(parseJsonResponse)
             .then(bundle => {
                 const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(bundle));
                 const downloadAnchor = document.createElement('a');
                 downloadAnchor.setAttribute("href", dataStr);
-                downloadAnchor.setAttribute("download", `Case_Intelligence_Workspace_${new Date().toISOString().slice(0,10)}.ccrm`);
+                downloadAnchor.setAttribute("download", `Case_Workspace_${new Date().toISOString().slice(0,10)}.ccrm`);
                 document.body.appendChild(downloadAnchor);
                 downloadAnchor.click();
                 downloadAnchor.remove();
             })
-            .catch(err => alert("Workspace payload generation faulted: " + err));
+            .catch(err => alert("Workspace payload generation faulted: " + err.message));
         }
 
         function importForensicWorkspace(event) {
@@ -594,19 +744,17 @@
             formData.append('workspace_file', file);
 
             fetch('/import-workspace', { method: 'POST', body: formData })
-            .then(res => res.json())
+            .then(parseJsonResponse)
             .then(data => {
                 if(data.error) alert(data.error);
                 else {
-                    alert("Case file workspace verified and restored successfully.");
+                    alert("Case workspace restored successfully.");
                     updateUI(data);
                 }
             })
-            .catch(err => alert("Workspace validation drop faulted: " + err));
+            .catch(err => alert("Workspace import faulted: " + err.message));
             event.target.value = '';
         }
-
-        let currentLayoutName = 'cose';
 
         function changeLayout(name) {
             currentLayoutName = name;
@@ -614,31 +762,93 @@
         }
 
         function buildLayoutConfig(elementCount) {
-            // Large graphs (busy CDR batches) get a lighter, non-animated layout
-            // so the tab doesn't freeze while physics-based layouts settle
-            // thousands of nodes. Non-physics layouts (grid/circle/etc.) are
-            // cheap regardless of size, so they skip the heavy-graph tuning.
             const isLarge = elementCount > 400;
 
-            if (currentLayoutName === 'cose') {
+            if (currentLayoutName === 'fcose' && typeof cytoscape('core', 'fcose') === 'function') {
                 return {
-                    name: 'cose', animate: !isLarge, fit: true, padding: 50,
-                    numIter: isLarge ? 1000 : 2500,
-                    nodeRepulsion: isLarge ? 8000 : 400000
+                    name: 'fcose',
+                    quality: 'proof',
+                    animate: !isLarge,
+                    fit: true,
+                    padding: 120,
+                    nodeSeparation: 380,
+                    idealEdgeLength: function(edge) {
+                        if (edge.data('edge_type') === 'cross_link') return 480;
+                        if (edge.source().hasClass('role_main_target') || edge.target().hasClass('role_main_target')) return 440;
+                        if (edge.source().hasClass('role_bridge_node') || edge.target().hasClass('role_bridge_node')) return 360;
+                        return 240;
+                    },
+                    nodeRepulsion: function(node) {
+                        if (node.hasClass('role_main_target')) return 4500000;
+                        if (node.hasClass('role_bridge_node')) return 2800000;
+                        return 1200000;
+                    },
+                    edgeElasticity: function(edge) {
+                        if (edge.source().hasClass('role_main_target') || edge.target().hasClass('role_main_target')) {
+                            return 0.15;
+                        }
+                        return 0.45;
+                    },
+                    gravity: 0.03,
+                    gravityRange: 4.5,
+                    gravityCompound: 0.03,
+                    tile: true,
+                    tilingPaddingVertical: 120,
+                    tilingPaddingHorizontal: 120
                 };
             }
+
             if (currentLayoutName === 'concentric') {
                 return {
-                    name: 'concentric', animate: !isLarge, fit: true, padding: 50,
+                    name: 'concentric',
+                    animate: !isLarge,
+                    fit: true,
+                    padding: 80,
                     concentric: n => n.data('connections') || 1,
-                    levelWidth: () => 2, minNodeSpacing: isLarge ? 8 : 20
+                    levelWidth: () => 2,
+                    minNodeSpacing: isLarge ? 50 : 100,
+                    spacingFactor: 2.0
                 };
             }
+
             if (currentLayoutName === 'breadthfirst') {
-                return { name: 'breadthfirst', animate: !isLarge, fit: true, padding: 50, directed: false, spacingFactor: isLarge ? 0.6 : 1.2 };
+                return { 
+                    name: 'breadthfirst', 
+                    animate: !isLarge, 
+                    fit: true, 
+                    padding: 80, 
+                    directed: false, 
+                    spacingFactor: 2.2 
+                };
             }
-            // circle, grid, and any other simple layouts
-            return { name: currentLayoutName, animate: !isLarge, fit: true, padding: 50 };
+
+            return {
+                name: 'cose',
+                animate: !isLarge,
+                fit: true,
+                padding: 140,
+                numIter: isLarge ? 1800 : 3500,
+                nodeRepulsion: function(node) {
+                    if (node.hasClass('role_main_target')) return 18000000;
+                    if (node.hasClass('role_bridge_node')) return 9000000;
+                    return 2500000;
+                },
+                idealEdgeLength: function(edge) {
+                    if (edge.data('edge_type') === 'cross_link') return 480;
+                    if (edge.source().hasClass('role_main_target') || edge.target().hasClass('role_main_target')) return 380;
+                    if (edge.source().hasClass('role_bridge_node') || edge.target().hasClass('role_bridge_node')) return 300;
+                    return 200;
+                },
+                edgeElasticity: function(edge) {
+                    if (edge.source().hasClass('role_main_target') || edge.target().hasClass('role_main_target')) return 2;
+                    return 8;
+                },
+                nestingFactor: 0.01,
+                gravity: 0.02,
+                nodeOverlap: 60,
+                initialTemp: 450,
+                coolingFactor: 0.98
+            };
         }
 
         function renderGraph(elements) {
@@ -647,25 +857,49 @@
                 container: document.getElementById('cy'),
                 elements: elements,
                 style: [
-                    { selector: 'node', style: { 'width': 'data(size)', 'height': 'data(size)', 'overlay-padding': '4px', 'label': 'data(tag)', 'color': '#ffe14d', 'font-weight': 'bold', 'font-size': '10px', 'text-valign': 'top', 'text-margin-y': -4 } },
-                    { selector: 'node.phone_standard', style: { 'background-color': '#5bc0be' } },
-                    { selector: 'node.phone_orange', style: { 'background-color': '#ffaa00' } },  
-                    { selector: 'node.bank_node', style: { 'background-color': '#ff4d6d' } },     
-                    { selector: 'node.group_node', style: { 'background-color': '#7b2ff7', 'shape': 'hexagon', 'label': 'data(group_label)', 'color': '#fff', 'font-size': '9px', 'text-valign': 'bottom', 'text-margin-y': 4 } },
-                    { selector: 'node.search-hit', style: { 'border-width': 4, 'border-color': '#ffe14d', 'border-style': 'solid' } },
+                    { 
+                        selector: 'node', 
+                        style: { 
+                            'shape': 'ellipse',
+                            'width': 'data(size)', 
+                            'height': 'data(size)', 
+                            'overlay-padding': '6px', 
+                            'label': 'data(tag)', 
+                            'color': '#ffe14d', 
+                            'font-weight': 'bold', 
+                            'font-size': '11px', 
+                            'text-valign': 'top', 
+                            'text-margin-y': -6 
+                        } 
+                    },
+
+                    // Classic Round Nodes
+                    { selector: 'node.phone_standard', style: { 'background-color': '#5bc0be', 'shape': 'ellipse' } },
+                    { selector: 'node.role_main_target', style: { 'background-color': '#ffd166', 'border-width': 4, 'border-color': '#ffbe0b', 'shape': 'ellipse' } },
+                    { selector: 'node.role_bridge_node', style: { 'background-color': '#00b4d8', 'border-width': 3, 'border-color': '#90e0ef', 'shape': 'ellipse' } },
+                    { selector: 'node.phone_orange', style: { 'background-color': '#ffaa00', 'shape': 'ellipse' } },
+                    { selector: 'node.bank_node', style: { 'background-color': '#ff4d6d', 'shape': 'ellipse' } },
+                    { selector: 'node.purple_aggregate_node, node.group_node', style: { 'background-color': '#9d4edd', 'shape': 'hexagon', 'label': 'data(group_label)', 'color': '#fff', 'font-size': '10px', 'text-valign': 'bottom', 'text-margin-y': 5 } },
                     
-                    { selector: 'edge', style: { 'width': 1.5, 'line-color': '#ffffff', 'curve-style': 'straight', 'label': 'data(weight)', 'font-size': '10px', 'color': '#ffffff', 'text-background-opacity': 1, 'text-background-color': '#0b132b', 'text-background-padding': '2px' } },
+                    // Highlights (Rings)
+                    { selector: 'node.ring_top_volume', style: { 'border-width': 5, 'border-color': '#ff0054', 'border-style': 'solid' } },
+                    { selector: 'node.ring_top_duration', style: { 'border-width': 5, 'border-color': '#f77f00', 'border-style': 'solid' } },
+                    { selector: 'node.ring_top_both', style: { 'border-width': 6, 'border-color': '#ffbe0b', 'border-style': 'double' } },
+                    
+                    { selector: 'node.search-hit', style: { 'border-width': 6, 'border-color': '#ffe14d', 'border-style': 'solid' } },
+
+                    // Edges
+                    { selector: 'edge', style: { 'width': 1.8, 'line-color': '#ffffff', 'curve-style': 'straight', 'label': 'data(weight)', 'font-size': '10px', 'color': '#ffffff', 'text-background-opacity': 1, 'text-background-color': '#0b132b', 'text-background-padding': '3px' } },
                     { selector: 'edge.financial_edge', style: { 'line-color': '#06d6a0' } },
-                    { selector: 'edge.cross_link_edge', style: { 'line-color': '#00b4d8', 'line-style': 'dashed', 'color': '#00b4d8', 'width': 2 } },
-                    { selector: 'edge.group_link_edge', style: { 'line-color': '#7b2ff7', 'line-style': 'dotted', 'color': '#7b2ff7' } },
-                    
+                    { selector: 'edge.cross_link_edge', style: { 'line-color': '#00b4d8', 'line-style': 'dashed', 'color': '#00b4d8', 'width': 2.5 } },
+                    { selector: 'edge.purple_link_edge, edge.group_link_edge', style: { 'line-color': '#9d4edd', 'line-style': 'dotted', 'color': '#c77dff' } },
+
                     { selector: 'edge[arrow_mode="forward"]', style: { 'target-arrow-shape': 'triangle', 'target-arrow-color': '#ffffff' } },
                     { selector: 'edge[arrow_mode="forward"].financial_edge', style: { 'target-arrow-color': '#06d6a0' } },
                     { selector: 'edge[arrow_mode="backward"]', style: { 'source-arrow-shape': 'triangle', 'source-arrow-color': '#ffffff' } },
                     { selector: 'edge[arrow_mode="backward"].financial_edge', style: { 'source-arrow-color': '#06d6a0' } },
                     { selector: 'edge[arrow_mode="both"]', style: { 'source-arrow-shape': 'triangle', 'source-arrow-color': '#ffffff', 'target-arrow-shape': 'triangle', 'target-arrow-color': '#ffffff' } },
-                    { selector: 'edge[arrow_mode="both"].financial_edge', style: { 'source-arrow-color': '#06d6a0', 'target-arrow-color': '#06d6a0' } },
-                    { selector: 'edge.top_edge_highlight', style: { 'width': 5, 'line-color': '#ff1744', 'target-arrow-color': '#ff1744', 'source-arrow-color': '#ff1744', 'font-weight': 'bold', 'color': '#ff1744' } }
+                    { selector: 'edge[arrow_mode="both"].financial_edge', style: { 'source-arrow-color': '#06d6a0', 'target-arrow-color': '#06d6a0' } }
                 ],
                 layout: buildLayoutConfig(elements.length)
             });
@@ -674,8 +908,7 @@
 
             cyInstance.on('tap', 'node', function(evt){
                 const targetNode = evt.target;
-                const nodeData = targetNode.data();
-                renderNodeDetails(nodeData);
+                renderNodeDetails(targetNode.data());
             });
 
             cyInstance.on('tap', function(e){ if(e.target === cyInstance) closeDetails(); });
@@ -697,30 +930,30 @@
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ tag: tag })
             })
-            .then(res => res.json())
+            .then(parseJsonResponse)
             .then(result => {
                 if (cyInstance && cyInstance.getElementById(nodeId).length > 0) {
                     cyInstance.getElementById(nodeId).data('tag', result.tag);
                 }
             })
-            .catch(err => alert("Failed to save tag: " + err));
+            .catch(err => alert("Failed to save tag: " + err.message));
         }
 
         function renderNodeDetails(nodeData) {
             let html = "";
 
-            if (nodeData.node_type === 'group') {
+            if (nodeData.node_type === 'purple_aggregate' || nodeData.node_type === 'group') {
                 const noun = nodeData.member_type === 'phone' ? 'numbers' : 'accounts';
-                html += `<p><strong>Node Identity:</strong> Low-Activity Group</p>`;
-                html += `<p><strong>Grouped ${noun}:</strong> ${nodeData.group_count}</p>`;
-                html += `<p><strong>Combined Volume:</strong> ${nodeData.total_interactions} interactions</p>`;
-                html += `<p style="color:#a5a5a5; font-size:0.75rem;">These were collapsed because every connection they have falls below your grouping threshold. If one turns out to be significant, pull it out below to map it individually.</p>`;
-                html += `<h4>Group Members</h4>`;
-                html += `<div id="group-member-list" style="max-height:300px; overflow-y:auto;">`;
-                nodeData.member_ids.forEach(id => {
-                    html += `<div style="display:flex; justify-content:space-between; align-items:center; padding:4px 0; border-bottom:1px solid #3a506b; font-size:0.8rem;">
-                        <span>${id}</span>
-                        <button onclick="expandGroupMember('${id}', '${nodeData.member_type}')" style="background:#7b2ff7; border:none; color:#fff; padding:3px 8px; border-radius:3px; font-size:0.7rem; cursor:pointer;">Map Individually</button>
+                html += `<p><strong>Node Identity:</strong> Routine / Non-Suspicious Bucket</p>`;
+                html += `<p><strong>Aggregated ${noun}:</strong> ${nodeData.group_count}</p>`;
+                html += `<p><strong>Total Cumulative Traffic:</strong> ${nodeData.total_interactions} interactions</p>`;
+                html += `<p style="color:#a5a5a5; font-size:0.75rem; margin-top:4px;">These low-frequency contacts fell below individual suspicion thresholds. Click <em>Take Out (Map)</em> to isolate any contact on the canvas.</p>`;
+                html += `<h4>Bucket Contacts</h4>`;
+                html += `<div id="group-member-list" style="max-height:260px; overflow-y:auto; margin-top:6px;">`;
+                (nodeData.member_ids || []).forEach(id => {
+                    html += `<div style="display:flex; justify-content:space-between; align-items:center; padding:6px 0; border-bottom:1px solid #3a506b; font-size:0.8rem;">
+                        <span style="font-family:monospace; font-weight:600; color:#ffe14d;">${id}</span>
+                        <button class="unpack-btn" onclick="expandMember('${id}', '${nodeData.member_type}', '${nodeData.id}')">Take Out (Map)</button>
                     </div>`;
                 });
                 html += `</div>`;
@@ -730,15 +963,23 @@
                 return;
             }
 
+            if (nodeData.flags && nodeData.flags.length > 0) {
+                html += `<h4>🚨 Suspicion & Rank Flags</h4><div class="badge-list">`;
+                nodeData.flags.forEach(flag => {
+                    let badgeClass = 'flag-badge';
+                    if (flag.includes('Top 5 Duration')) badgeClass += ' top-dur';
+                    if (flag.includes('Top 3 Calls')) badgeClass += ' top-vol';
+                    html += `<span class="${badgeClass}">${flag}</span>`;
+                });
+                html += `</div>`;
+            }
+
             if (nodeData.node_type === 'phone') {
                 html += `<p><strong>Node Identity:</strong> Telephony Target</p>`;
                 html += `<p><strong>Phone Number:</strong> ${nodeData.phone_number}</p>`;
                 html += renderTagEditor(nodeData.phone_number, nodeData.tag);
                 html += `<p><strong>Total Matches:</strong> ${nodeData.total_interactions} log entries</p>`;
-                html += `<p><strong>Distinct Connections:</strong> ${nodeData.connections} unique numbers</p>`;
-                if (nodeData.source_files && nodeData.source_files.length > 0) {
-                    html += `<p><strong>Appears In:</strong> ${nodeData.source_files.join(', ')}</p>`;
-                }
+                html += `<p><strong>Distinct Connections:</strong> ${nodeData.connections} unique entities</p>`;
 
                 if (nodeData.linked_banks && nodeData.linked_banks.length > 0) {
                     html += `<h4>Linked Financial Accounts</h4>`;
@@ -753,9 +994,6 @@
                 html += renderTagEditor(nodeData.account_number, nodeData.tag);
                 html += `<p><strong>Total Logged Txns:</strong> ${nodeData.total_transactions} operations</p>`;
                 html += `<p><strong>Distinct Connections:</strong> ${nodeData.connections} unique accounts</p>`;
-                if (nodeData.source_files && nodeData.source_files.length > 0) {
-                    html += `<p><strong>Appears In:</strong> ${nodeData.source_files.join(', ')}</p>`;
-                }
 
                 let associatedPhones = [];
                 cyInstance.nodes('.phone_orange').forEach(n => {
@@ -776,14 +1014,12 @@
             document.getElementById('intelligence-dump').innerHTML = html;
             document.getElementById('details-card').classList.add('active');
 
-            // Fetch the (potentially large) record list on demand, only for
-            // this one node, instead of shipping it inside the main graph payload.
             const nodeId = nodeData.node_type === 'phone' ? nodeData.phone_number : nodeData.account_number;
             fetch(`/node-details/${encodeURIComponent(nodeId)}?type=${nodeData.node_type}`)
-            .then(res => res.json())
+            .then(parseJsonResponse)
             .then(detail => {
                 const slot = document.getElementById('log-detail-slot');
-                if (!slot) return; // user already navigated away
+                if (!slot) return;
                 if (!detail.records || detail.records.length === 0) {
                     slot.innerHTML = `<p style="color:#a5a5a5; font-size:0.85rem;">No detailed records available.</p>`;
                     return;
@@ -824,46 +1060,16 @@
             })
             .catch(err => {
                 const slot = document.getElementById('log-detail-slot');
-                if (slot) slot.innerHTML = `<p style="color:#ff5555; font-size:0.85rem;">Failed to load records: ${err}</p>`;
+                if (slot) slot.innerHTML = `<p style="color:#ff5555; font-size:0.85rem;">Failed to load records: ${err.message}</p>`;
             });
-        }
-
-        function expandGroupMember(nodeId, memberType) {
-            fetch(`/expand-member/${encodeURIComponent(nodeId)}?type=${memberType}`)
-            .then(res => res.json())
-            .then(data => {
-                if (data.error) { alert(data.error); return; }
-                if (!cyInstance) return;
-
-                if (cyInstance.getElementById(nodeId).length === 0) {
-                    cyInstance.add(data.node);
-                }
-                data.edges.forEach(edgeEl => {
-                    const src = edgeEl.data.source, tgt = edgeEl.data.target;
-                    // Only add the edge if both endpoints are actually on the canvas,
-                    // to avoid a dangling reference to a still-grouped neighbour.
-                    if (cyInstance.getElementById(src).length > 0 && cyInstance.getElementById(tgt).length > 0
-                        && cyInstance.getElementById(edgeEl.data.id).length === 0) {
-                        cyInstance.add(edgeEl);
-                    }
-                });
-
-                applyGraphFilters();
-                cyInstance.layout(buildLayoutConfig(cyInstance.elements().length)).run();
-                closeDetails();
-            })
-            .catch(err => alert("Failed to map member individually: " + err));
         }
 
         function applyGraphFilters() {
             if (!cyInstance) return;
 
-            const showLow = document.getElementById('filter-low').checked;
-            const showHigh = document.getElementById('filter-high').checked;
             const showPhone = document.getElementById('filter-phone').checked;
             const showBank = document.getElementById('filter-bank').checked;
-            const showGroups = document.getElementById('filter-groups').checked;
-            const linkedOnly = document.getElementById('filter-linked-only').checked;
+            const showPurple = document.getElementById('filter-purple').checked;
             const minConnections = parseInt(document.getElementById('min-connections-input').value, 10) || 0;
             const searchTerm = document.getElementById('search-highlight-input').value.trim().toLowerCase();
 
@@ -871,26 +1077,17 @@
                 cyInstance.nodes().forEach(node => {
                     const nodeType = node.data('node_type');
 
-                    if (nodeType === 'group') {
-                        const memberType = node.data('member_type');
-                        const isTypeVisible = (memberType === 'phone' && showPhone) || (memberType === 'bank' && showBank);
-                        node.style('display', (isTypeVisible && showGroups) ? 'element' : 'none');
+                    if (nodeType === 'purple_aggregate' || nodeType === 'group') {
+                        node.style('display', showPurple ? 'element' : 'none');
                         node.removeClass('search-hit');
                         return;
                     }
 
-                    const totalInteractions = node.data('total_interactions') || node.data('total_transactions') || 0;
                     const connections = node.data('connections') || 0;
-                    const isLinked = node.hasClass('phone_orange') || (node.data('linked_banks') && node.data('linked_banks').length > 0);
-                    const sourceFiles = node.data('source_files') || [];
-                    const allFilesHidden = sourceFiles.length > 0 && sourceFiles.every(f => hiddenFiles.has(f));
-
                     const isTypeVisible = (nodeType === 'phone' && showPhone) || (nodeType === 'bank' && showBank);
-                    const isCountVisible = (totalInteractions < 100 && showLow) || (totalInteractions >= 100 && showHigh);
                     const passesConnections = connections >= minConnections;
-                    const passesLinked = !linkedOnly || isLinked;
 
-                    const visible = isTypeVisible && isCountVisible && passesConnections && passesLinked && !allFilesHidden;
+                    const visible = isTypeVisible && passesConnections;
                     node.style('display', visible ? 'element' : 'none');
 
                     if (searchTerm) {
@@ -902,7 +1099,6 @@
                     }
                 });
 
-                // Hide edges connected to hidden nodes automatically
                 cyInstance.edges().forEach(edge => {
                     const hidden = edge.source().style('display') === 'none' || edge.target().style('display') === 'none';
                     edge.style('display', hidden ? 'none' : 'element');
