@@ -67,6 +67,14 @@ Open your web browser and navigate to http://localhost:80 to initialize investig
 ## 🔒 Forensic Safety Profile
 * The tool implements volatile stream-based processing (io.StringIO), leaving zero remnant log footprints or temp file storage trails in the host machine's directory tree.
 * Avoid server-restart data wipes during long operations by utilizing the localized workspace generation protocol (.ccrm).
+ 
+---
+
+## New Version Screenshots
+![CCRM Interface Dashboard Screenshot](/Screenshots/New.png)
+
+With Real Data of ~10,000 Rows/Records:
+![CCRM Interface Dashboard Screenshot](/Screenshots/New2.png)
 
 ---
 Developed for practical deployment across regional cyber units and tactical police cells.
